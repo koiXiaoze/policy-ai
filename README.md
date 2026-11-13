@@ -18,7 +18,7 @@
 
 ### 效果与实际验证
 
-以下素材来自 2026-11-12 至 2026-11-13 的脱敏验证：真实 AI 分析记录、来源运行链路巡检、来源结构探针，以及企业微信、邮件实发台账。它们用于说明当前效果，**不代表全量历史、持续稳定性或生产 SLA**。SQLite、Alembic 和 FastAPI `/health` 已在本地隔离环境实测；最终提交的 PostgreSQL 16、Docker Compose 与健康检查由 GitHub Actions 复验。每日 Canary 用于发现来源变化和诊断故障，不承诺外部政府站点永久可用；飞书和通知效果截图仍未完成真实验收。
+以下素材来自 2026-11-12 至 2026-11-13 的脱敏验证：真实 AI 分析记录、来源运行链路巡检、来源结构探针，以及企业微信、邮件实发台账。它们用于说明当前效果，**不代表全量历史、持续稳定性或生产 SLA**。SQLite、Alembic 和 FastAPI `/health` 已在本地隔离环境实测；最终提交的 PostgreSQL 16、Docker Compose 与健康检查由 GitHub Actions 复验。政府站点 Canary 继续作为发布后巡检和诊断门禁，但外部站点的 WAF、区域网络或第三方搜索配额可能使托管 Runner 失败；该结果不等同于软件部署链路失效，也不构成永久可用承诺。飞书和通知效果截图仍未完成真实验收。
 
 #### 真实 AI 分析样例
 
@@ -101,27 +101,40 @@ flowchart TD
 | SQLite 初始化与迁移 | 已通过 | 使用隔离 SQLite 执行 `python main.py init`，Alembic 版本为 `91a4d2f7c8b0 (head)`。 |
 | FastAPI 健康检查 | 已通过 | Uvicorn 实际启动后，`GET /health` 返回 HTTP 200；数据库、Scheduler 和 Agent 状态正常。 |
 | Release Smoke Check | 由最终提交复验 | `.github/workflows/ci.yml` 在全新 Ubuntu 与 Python 3.11 中执行依赖安装、SQLite 初始化和 `/health`；PostgreSQL 16 job 执行迁移、真实读写和 API 健康检查；Docker job 实际执行 `docker compose up --build --detach`，并检查容器 `healthy` 与 `/health`。发布结论以最终 `main` 提交的最新成功运行结果为准，不在文档中固化运行编号。 |
-| 当前启用来源手动 Canary | 由最终提交复验 | `.github/workflows/source-canary.yml` 固定核验 5 个来源名称、非空列表与首条正文阈值，并仅上传脱敏 Manifest。发布前必须对最终 `main` 提交手动运行并确认 5/5；报告以该次 Actions Artifact 为准，不在文档中固化历史运行编号。手动运行用于发布验证，只有 `event=schedule` 运行计入发布后趋势。 |
+| 当前启用来源 Canary | 本地最终代码 5/5；托管 Runner 曾失败，继续巡检 | 本地对提交 `75cf4a4` 的最终代码逐源执行 Canary，5/5 通过：国务院 29 条/正文 12000 字符、湖北省 20/5216、武汉市 4/7027、十堰市 5/2851、人社部 8/227。GitHub 托管 Runner 的两次手动运行见下方诊断记录；工作流在该环境下仍按设计失败，需继续观察外部访问条件。Canary 是来源可用性诊断，不作为软件版本永久 SLA 或发布日期前置条件。 |
 | AI 分析 | 已通过（历史受控样本） | 在隔离 SQLite 环境中真实采集全部 5 个启用来源并取得 69 条；受控选取 1 条送入流水线，由兼容模型完成全文结构化分析，趋势评分 72，生成日报并落库。该结果只证明一次受控样本链路；CI 不会使用真实模型凭据。 |
 | 真实通知投递 | 企业微信、邮件历史受控实发；飞书未验证 | 2026-11-13 实际发送企业微信 2/2 分片、邮件 1/1 分片，均无重试，台账状态为 `success`。该结果为历史受控样本，CI 不会发送真实通知；飞书未配置且未实发，不能记为通过。 |
 | 来源巡检自动化 | 已配置 | `.github/workflows/source-canary.yml` 每日 00:17 UTC（北京时间 08:17）运行，使用固定 5 来源名称、数量、列表数和正文阈值门禁；仅上传脱敏 Manifest。Tavily 是推荐增强项，不是五来源运行的硬依赖。每日巡检用于发现和诊断外部站点变化，不承诺永久可用。 |
 | 发布后滚动趋势 | 已配置，尚未积累 | 仅统计每日 `event=schedule` 的 Canary；用于发布后观察近期可用性，不阻断发布日期，也不替代发布时的最终 HEAD 验证。失败或缺失会记录并触发排查，不会预填未来通过记录。连续 14 天验证不作为本次发布的前置条件。 |
 | 敏感信息审计 | 最终提交前重跑 | 公开发布前必须对最终发布提交和全部 `origin` Ref 执行阻断式全历史审计，并确认无高危凭据格式或实际非空配置值。审计未通过时不得切换为 Public。 |
-| 可公开性 | 最终门禁通过后公开 | 当前为单根 Private 仓库，跟踪树未包含测试、数据库、日志、报告或缓存路径。最终 `main` 提交的 Smoke Check、手动 Canary 5/5 和全历史安全审计全部通过后，切换为 Public 并完成匿名核验。 |
+| 可公开性 | 发布时核验 | 仓库为单根仓库，跟踪树不得包含测试、数据库、日志、报告或缓存路径。最终 `main` 提交的 Release Smoke Check 和全历史安全审计通过后，切换为 Public 并完成匿名核验；政府站点托管 Canary 的结果需如实保留，不以伪造或重试筛选替代。 |
 
 发布后滚动记录见 [`docs/source-canary-acceptance.md`](docs/source-canary-acceptance.md)。滚动趋势只作为发布后的质量观察；若定时 Canary 出现真实失败，应修复并更新部署，而不是把观察窗口未满当作阻止正式版本发布的理由。
 
 ### 发布路径结论
 
-当前 GitHub 仓库是 **Private 单根仓库**，不需要重建发布快照。公开发布顺序为：
+发布使用当前 GitHub 单根仓库，不需要重建发布快照。公开发布顺序为：
 
 1. 完成文档、配置模板、工作流和敏感信息清理，并提交到 `main`。
-2. 等待最终发布提交的 Release Smoke Check 全部成功，手动运行 Government Source Canary 并确认固定 5 来源 5/5、Artifact 完整。
+2. 等待最终发布提交的 Release Smoke Check 全部成功，并核验 PostgreSQL 16、Docker Compose 与 `/health` 的真实执行结果。
 3. 对最终发布提交和全部 `origin` Ref 执行全历史安全审计；同时确认远端仅保留 `main` 且无标签。
-4. 在旧 GitHub 凭据已撤销或轮换的前提下，将仓库切换为 Public。
-5. 通过无认证请求确认 `private: false`、README 和工作流文件可访问，并保留每日 Canary 和滚动趋势巡检。
+4. 记录最近一次本地与托管环境 Government Source Canary 的完整结果；失败必须如实保留，不阻断仅由外部站点访问限制导致的软件版本发布。
+5. 在旧 GitHub 凭据已撤销或轮换的前提下，将仓库切换为 Public。
+6. 通过无认证请求确认 `private: false`、README 和工作流文件可访问，并保留每日 Canary 和滚动趋势巡检。
 
-全历史安全审计失败时必须暂停公开；滚动趋势未满不阻塞发布。外部政府网站改版、WAF 策略变化或区域网络中断无法被代码永久消除，长期可用性通过持续巡检、失败告警和及时修复维持。
+全历史安全审计或 Release Smoke Check 失败时必须暂停公开；滚动趋势未满不阻塞发布。外部政府网站改版、WAF 策略变化或区域网络中断无法被代码永久消除，长期可用性通过持续巡检、失败告警和及时修复维持。
+
+### 政府站点 Canary 诊断记录
+
+2026-11-13 对提交 `75cf4a4` 的真实结果如下。两套环境使用不同出口网络与第三方配额，不能互相替代：
+
+| 环境 | 运行 | 结果 | 说明 |
+|---|---|---|---|
+| 本地最终代码 | 手动全来源 Canary | 5/5 通过 | 五个来源均取得非空列表和首条正文；正文长度见验证状态表。 |
+| GitHub 托管 Runner | `43447139528` | 1/5 通过 | 国务院通过；湖北正文为空；武汉 Tavily 配额耗尽；十堰三条通道均连接失败；人社部触发 WAF。 |
+| GitHub 托管 Runner | `43448420186` | 1/5 通过 | 国务院通过；湖北、武汉为 `quota_exhausted`；十堰直连、Tavily、Scrapling 三通道失败；人社部为 `waf_challenge`。Artifact `14048933270` 为脱敏 Manifest。 |
+
+这两次托管失败发生在相同提交和相同核心采集代码上，失败来源均涉及外部访问、WAF 或第三方配额，而非 Python 依赖安装、SQLite 初始化、Playwright 安装或工作流执行错误。工作流门禁仍会如实失败，不能把 Artifact 解释为 5/5 通过。部署使用者应根据本地网络条件自行运行 `source-canary`，并结合日志排查具体来源。
 
 ### 发布审计命令
 
@@ -235,7 +248,7 @@ python -m pip install -e .
 pia --help
 ```
 
-## 配置
+## 配置说明
 
 从模板创建本地配置：
 
@@ -482,24 +495,18 @@ docker compose down
 **Docker 启动后服务不健康**
 查看 `docker compose logs policy-agent`，确认 `.env` 已创建、数据库可写、`/app/data` 权限正确；首次构建失败不等于部署完成。
 
-## 发布验收清单
+## 发布核验流程
 
-- [x] 在全新 Python 3.12 虚拟环境执行 `pip install -r requirements.txt` 和 `pip check`。
-- [x] 使用隔离 SQLite 执行 `python main.py init`、`python -m alembic current`。
-- [x] 启动 FastAPI，确认 `/health` 返回 200 且数据库、Scheduler、Agent 状态正常，然后关闭测试进程。
-- [x] 完成一次五来源真实采集和来源结构探针，并记录口径限制。
-- [x] 补充 5 张来自真实数据的脱敏展示图、系统架构图和两项数据流图。
-- [ ] 在最终发布提交上确认 GitHub Actions PostgreSQL 16 job 通过初始化、迁移、读写往返和 API 健康检查。
-- [ ] 在最终发布提交上确认 GitHub Actions Docker job 实际构建、启动容器并检查健康状态与 `/health`。
-- [x] 历史上使用真实 API 凭据完成一次受控的“采集 → AI 分析 → 报告生成 → 企业微信和邮件通知”链路；采集范围是全部 5 个启用来源，分析样本为 1 条。该证据不表示 CI 使用真实凭据或持续验证外部服务。
-- [ ] 在获得明确授权和测试渠道后，补充真实通知效果截图；Docker 部署截图不作为必需项。
-- [ ] 在最终发布提交上手动执行 Government Source Canary；固定 5 个启用来源的列表与首条正文必须全部通过。
-- [ ] 保存最终手动 Canary 的脱敏 Artifact，并确认报告为 5/5、无校验错误。
-- [x] 每日 canary 采用固定 5 来源门禁，任一来源缺失、改名、列表为空或正文低于阈值时任务失败，并仅上传脱敏 Manifest。
-- [ ] 在最终发布提交上完成 Release Smoke Check、手动 Canary 5/5 和全历史安全审计；滚动趋势在发布后持续记录，不作为发布前置条件。
-- [ ] 对最终发布提交与全部可达对象复扫，确认无 `.env`、数据库、日志、报告、测试文件、临时文件及敏感值。
-- [ ] 删除远端 `codex/*` 临时分支，确认 `origin` 仅保留 `main` 且无标签。
-- [ ] 通过无认证请求确认公开后仓库 `private: false`、README 和工作流可见。
+执行发布时逐项确认并保留证据，不用历史成功代替最终提交验证：
+
+1. 在全新 Python 环境执行 `pip install -r requirements.txt`、`pip check` 和 `python main.py init`。
+2. 运行 PostgreSQL 16 迁移、真实读写往返和 API `/health` 检查。
+3. 实际执行 `docker compose up --build --detach`，检查容器健康状态和 `/health`，再执行 `docker compose down`。
+4. 使用真实 AI、通知凭据的验证仅在获得授权并确认测试渠道后进行；不要在 CI 日志或截图中暴露凭据、收件人、群成员或 Webhook。
+5. 运行固定五来源 Canary，记录列表数、正文状态和脱敏 Artifact；外部失败如实记录，不能改写为通过。
+6. 对最终提交与全部可达 Git 对象执行阻断式安全审计，确认无 `.env`、数据库、日志、报告、测试文件、临时文件及敏感值。
+7. 确认 `origin` 仅保留 `main` 且无临时标签，再将仓库切换为 Public。
+8. 通过无认证请求确认 `private: false`、README 和工作流可访问；真实通知截图待有授权渠道后补充，Docker 部署截图不作为介绍页必需项。
 
 ## 许可证
 
