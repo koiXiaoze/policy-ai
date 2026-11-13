@@ -1,8 +1,8 @@
 name: Government Source Canary
 
-on:
+"on":
   schedule:
-    # 每日 00:17 UTC（北京时间 08:17）巡检全部启用来源
+    # 每日 00:17 UTC（北京时间 08:17）巡检 5 个固定启用来源
     - cron: "17 0 * * *"
   workflow_dispatch:
 
@@ -53,19 +53,48 @@ jobs:
           python main.py init
           python -m alembic current
 
+      # 原始报告仅保留在工作区；即使失败也继续，由校验器判断最终门禁。
       - name: Run all-source canary
+        id: canary
+        continue-on-error: true
         run: python main.py source-canary --json --output reports/source-canary.json
+
+      # 固定 5 来源门禁：来源名称、数量、状态、列表数与正文阈值全部精确校验。
+      # 校验器只输出脱敏 Manifest，不包含正文、URL、请求头或凭据。
+      - name: Validate fixed-source gate and emit release manifest
+        id: validate
+        if: always()
+        run: |
+          python scripts/verify_source_canary.py \
+            --input reports/source-canary.json \
+            --manifest-output reports/release-manifest.json
 
       - name: Collect source diagnostics
         if: always()
         continue-on-error: true
         run: python main.py source-diagnostics --probe --json > reports/source-diagnostics.json
 
-      - name: Upload canary reports
+      # 仅上传校验器生成的脱敏 Manifest（以及可选的诊断摘要），不上传原始 canary 报告。
+      - name: Upload release evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: government-source-canary-${{ github.run_id }}
-          path: reports/*.json
-          if-no-files-found: warn
+          path: reports/release-manifest.json
+          if-no-files-found: error
           retention-days: 30
+
+      # 最终失败门禁：canary 或校验器任一步失败，任务失败；Artifact 仍已上传。
+      - name: Fail job when canary or gate failed
+        if: always()
+        env:
+          CANARY_OUTCOME: ${{ steps.canary.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+        run: |
+          echo "canary_outcome=$CANARY_OUTCOME"
+          echo "validate_outcome=$VALIDATE_OUTCOME"
+          if [ "$CANARY_OUTCOME" != "success" ] || [ "$VALIDATE_OUTCOME" != "success" ]; then
+            echo "canary 未通过固定 5 来源门禁"
+            exit 1
+          fi
+          echo "全部 5 个固定来源通过"
