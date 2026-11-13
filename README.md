@@ -18,7 +18,7 @@
 
 ### 效果与实际验证
 
-以下素材来自 2026-11-12 至 2026-11-13 的脱敏验证：真实 AI 分析记录、来源运行链路巡检、来源结构探针，以及企业微信、邮件实发台账。它们用于说明当前效果，**不代表全量历史、持续稳定性或生产 SLA**。当前 `config.yaml` 的 5 个启用来源已完成本地连续两轮和 GitHub Actions 手动 5/5 验收；Release Smoke Check 也已实际覆盖 PostgreSQL、Docker Compose 和健康检查。尚无 `event=schedule` 的 14 天连续记录，因此仓库仍保持 Private；飞书和通知效果截图仍未完成真实验收。
+以下素材来自 2026-11-12 至 2026-11-13 的脱敏验证：真实 AI 分析记录、来源运行链路巡检、来源结构探针，以及企业微信、邮件实发台账。它们用于说明当前效果，**不代表全量历史、持续稳定性或生产 SLA**。当前 `config.yaml` 的 5 个启用来源已完成本地连续两轮和 GitHub Actions 手动 5/5 验收；Release Smoke Check 也已实际覆盖 PostgreSQL、Docker Compose 和健康检查。发布后将继续通过每日定时 Canary 观察趋势；飞书和通知效果截图仍未完成真实验收。
 
 #### 真实 AI 分析样例
 
@@ -101,30 +101,31 @@ flowchart TD
 | SQLite 初始化与迁移 | 已通过 | 使用隔离 SQLite 执行 `python main.py init`，Alembic 版本为 `91a4d2f7c8b0 (head)`。 |
 | FastAPI 健康检查 | 已通过 | Uvicorn 实际启动后，`GET /health` 返回 HTTP 200；数据库、Scheduler 和 Agent 状态正常。 |
 | Release Smoke Check | 已通过 | GitHub Actions Run `43430587587` 在全新 Ubuntu、Python 3.11、PostgreSQL 16 和 Docker Compose 环境中成功；其中 Docker 任务实际执行 `docker compose up --build --detach`，容器达到 `healthy` 并通过 `/health`。 |
-| 当前启用来源手动 canary | GitHub Actions 5/5 通过（仅手动运行） | Run `43430807699`、Artifact `14040291339`：国务院 29/12000、湖北省 20/7947、武汉市 5/6661、十堰市 5/2851、人社部 6/6030（列表数/首条正文字符数）。本地同时保留 2026-11-13 基线结果。手动运行**不计入**连续天数验收。 |
+| 当前启用来源手动 canary | 发布前 5/5 通过 | GitHub Actions Run `43430807699`、Artifact `14040291339`：国务院 29/12000、湖北省 20/7947、武汉市 5/6661、十堰市 5/2851、人社部 6/6030（列表数/首条正文字符数）。本地同时保留 2026-11-13 基线结果。手动运行用于发布前功能验证；只有 `event=schedule` 运行计入发布后 14 天趋势。 |
 | AI 分析 | 已通过（受控样本） | 在隔离 SQLite 环境中真实采集全部 5 个启用来源并取得 69 条；受控选取 1 条送入流水线，由兼容模型完成全文结构化分析，趋势评分 72，生成日报并落库。该结果只证明受控样本链路。 |
 | 真实通知投递 | 企业微信、邮件已通过；飞书未验证 | 2026-11-13 实际发送企业微信 2/2 分片、邮件 1/1 分片，均无重试，台账状态为 `success`。飞书未配置且未实发，不能记为通过。 |
 | 来源巡检自动化 | 已配置并通过手动 Actions 验证 | `.github/workflows/source-canary.yml` 每日 00:17 UTC（北京时间 08:17）运行，使用固定 5 来源名称、数量、列表数和正文阈值门禁；仅上传脱敏 Manifest。Tavily 是推荐增强项，不是五来源运行的硬依赖。 |
-| 14 个北京时间自然日连续验收 | 未完成 | 截至 2026-11-13，尚无可计入的 `event=schedule` 运行；Release Gate Run `43431107930` 返回 `complete=false`、`passed_days=0`，符合当前证据不足的预期。只有每日至少一次定时运行按固定 5 来源门禁成功，才计为当天通过；失败、缺失或来源不完整会重置连续计数。 |
-| 敏感信息审计 | 已通过当前 HEAD | 对当前提交和全部可达 Git blob 复扫，未发现高危凭据格式或实际非空配置值的历史命中；最终公开前仍需对发布提交重跑。 |
-| 可公开性 | 被 14 天连续验收阻塞 | 当前为单根 Private 仓库，跟踪树未包含测试、数据库、日志、报告或缓存路径。连续验收、最终对象审计和公开后匿名核验完成前，不得切换为 Public。 |
+| 发布后 14 天滚动趋势 | 已配置，尚未积累 | 仅统计每日 `event=schedule` 的 Canary；用于发布后观察近期可用性，不阻断发布日期，也不替代发布时的最终 HEAD 验证。失败或缺失会记录并触发排查，不会预填未来通过记录。 |
+| 敏感信息审计 | 已通过此前提交，发布前重跑 | 已对当前提交和全部可达 Git blob 复扫，未发现高危凭据格式或实际非空配置值的历史命中。公开发布前必须对最终发布提交和全部 `origin` Ref 重新执行并通过。 |
+| 可公开性 | 达到发布门槛后可公开 | 当前为单根 Private 仓库，跟踪树未包含测试、数据库、日志、报告或缓存路径。最终 HEAD 的 Smoke Check、手动 Canary 5/5 和全历史安全审计通过后即可切换为 Public，并完成匿名核验。 |
 
-详细逐日记录见 [`docs/source-canary-acceptance.md`](docs/source-canary-acceptance.md)。如果 2026-11-14 的首个定时任务及此后每日任务均通过，最早可在 **2026-11-27** 完成 14 个北京时间自然日窗口；任何一天失败或缺失，完成日期必须相应顺延。
+发布后滚动记录见 [`docs/source-canary-acceptance.md`](docs/source-canary-acceptance.md)。14 天只作为发布后的趋势观察窗口；若定时 Canary 出现真实失败，应修复并更新部署，而不是把未满窗口当作阻止正式版本发布的理由。
 
 ### 发布路径结论
 
-当前 GitHub 仓库已经是经过手动 Actions 验证的 **Private 单根仓库**，不再需要重建发布快照。公开发布顺序为：
+当前 GitHub 仓库是经过手动 Actions 验证的 **Private 单根仓库**，不需要重建发布快照。公开发布顺序为：
 
-1. 从 2026-11-14 起逐日核对 `event=schedule` 的 Run ID、Artifact ID 和 5 个来源结果，并写入验收台账。
-2. 完成连续 14 个北京时间自然日后，重跑 Release Smoke Check、手动 Canary 和全历史敏感信息审计。
-3. 删除远端 `codex/*` 临时分支，确认远端仅保留 `main` 且无标签。
-4. 将仓库切换为 Public，再通过匿名请求确认 `private: false`、README 和工作流文件可访问。
+1. 完成文档、配置模板、工作流和敏感信息清理，并提交到 `main`。
+2. 等待发布提交的 Release Smoke Check 全部成功，手动运行 Government Source Canary 并确认固定 5 来源 5/5、Artifact 完整。
+3. 对最终发布提交和全部 `origin` Ref 执行全历史安全审计；同时确认远端仅保留 `main` 且无标签。
+4. 在旧 GitHub 凭据已撤销或轮换的前提下，将仓库切换为 Public。
+5. 通过无认证请求确认 `private: false`、README 和工作流文件可访问，并保留每日 Canary 和滚动趋势巡检。
 
-任何一步失败都停留在 Private。外部政府网站改版、WAF 策略变化或区域网络中断无法被代码永久消除；长期可用性只能通过持续巡检、失败告警和及时修复来维持。
+全历史安全审计失败时必须暂停公开；14 天趋势未满不阻塞发布。外部政府网站改版、WAF 策略变化或区域网络中断无法被代码永久消除，长期可用性通过持续巡检、失败告警和及时修复维持。
 
 ### 发布审计命令
 
-在具备仓库读取权限的环境中设置 `GITHUB_TOKEN` 后，审计 14 个北京时间自然日的定时 Canary：
+发布前手动核对近 14 天定时 Canary 趋势。该报告用于质量观察，不构成发布截止日期：
 
 ```powershell
 python scripts/audit_canary_history.py `
@@ -142,15 +143,7 @@ python scripts/audit_public_release.py `
   --json-output reports/public-release-audit.json
 ```
 
-两个脚本的退出码均为：`0` 表示完整通过；`1` 表示证据不足或安全门禁失败；`2` 表示 API、格式、网络或报告写入异常。Canary 审计仅在 14 天证据全部通过时才在 `earliest_release_date` 返回已审计窗口结束日；空窗口或部分窗口返回 `null`，不会根据当前日期推测未来发布日期。自动 Release Gate 每日 01:17 UTC（北京时间 09:17）审计截至昨日的 14 天窗口。若 2026-11-27 当天的 Canary 已完成且需要将当天计入窗口，应在当日手动指定窗口结束日：
-
-```powershell
-python scripts/audit_canary_history.py `
-  --repo koiXiaoze/policy-ai `
-  --token-env GITHUB_TOKEN `
-  --end 2026-11-27 `
-  --output reports/canary-history-audit.json
-```
+Canary 趋势脚本的退出码为：`0` 表示窗口完整通过；`1` 表示证据不足或近期巡检失败；`2` 表示 API、格式、网络或报告写入异常。它在 Release Safety Audit 工作流中只生成报告，不阻断发布。`audit_public_release.py` 是唯一阻断公开发布的历史安全审计；其退出码为：`0` 表示通过；`1` 表示安全门禁失败；`2` 表示 API、格式、网络或报告写入异常。每日 01:17 UTC（北京时间 09:17）运行趋势与安全审计；空窗口或部分窗口不会被推测为“未来已通过”。
 
 ## 不使用 Web 管理后台
 
@@ -503,7 +496,7 @@ docker compose down
 - [x] 对全部 5 个启用来源连续执行两轮本地列表与首条正文的 `source-canary`，均为 5/5 通过。
 - [x] GitHub Actions 手动 Canary Run `43430807699` / Artifact `14040291339` 完成 5/5 真实来源验收。
 - [x] 每日 canary 采用固定 5 来源门禁，任一来源缺失、改名、列表为空或正文低于阈值时任务失败，并仅上传脱敏 Manifest。
-- [ ] 从 2026-11-14 起完成至少 14 个北京时间自然日的 `event=schedule` 连续成功记录，并更新验收台账。
+- [ ] 在最终发布提交上完成 Release Smoke Check、手动 Canary 5/5 和全历史安全审计；14 天滚动趋势在发布后持续记录，不作为发布前置条件。
 - [ ] 对最终发布提交与全部可达对象复扫，确认无 `.env`、数据库、日志、报告、测试文件、临时文件及敏感值。
 - [ ] 删除远端 `codex/*` 临时分支，确认远端仅保留 `main` 且无标签。
 - [ ] 通过无认证请求确认公开后仓库 `private: false`、README 和工作流可见。

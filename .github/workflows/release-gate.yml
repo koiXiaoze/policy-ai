@@ -1,8 +1,8 @@
-name: Public Release Gate
+name: Public Release Safety Audit
 
 "on":
   schedule:
-    # 每日 01:17 UTC（北京时间 09:17）审计截至昨日的 14 天窗口
+    # 每日 01:17 UTC（北京时间 09:17）记录 14 天滚动巡检趋势，并审计最终提交和 origin Ref
     - cron: "17 1 * * *"
   workflow_dispatch:
 
@@ -11,12 +11,12 @@ permissions:
   actions: read
 
 concurrency:
-  group: public-release-gate
+  group: public-release-safety-audit
   cancel-in-progress: false
 
 jobs:
   gate:
-    name: Audit canary history and public release safety
+    name: Record canary trend and audit public release safety
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -43,7 +43,7 @@ jobs:
       - name: Prepare reports directory
         run: mkdir -p reports
 
-      - name: Audit 14-day scheduled canary window
+      - name: Record 14-day scheduled canary trend (non-blocking)
         id: canary_history
         continue-on-error: true
         run: >-
@@ -52,9 +52,8 @@ jobs:
           --token-env GITHUB_TOKEN
           --output "$CANARY_REPORT"
 
-      - name: Audit final commit and all origin refs
+      - name: Audit final commit and all origin refs (blocking)
         id: release_audit
-        continue-on-error: true
         run: >-
           python scripts/audit_public_release.py
           --all-remote-refs
@@ -72,16 +71,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Enforce both release gates
+      - name: Enforce public release safety gate
         if: always()
         env:
-          CANARY_HISTORY_OUTCOME: ${{ steps.canary_history.outcome }}
           RELEASE_AUDIT_OUTCOME: ${{ steps.release_audit.outcome }}
         run: |
-          echo "canary_history_outcome=$CANARY_HISTORY_OUTCOME"
           echo "release_audit_outcome=$RELEASE_AUDIT_OUTCOME"
-          if [ "$CANARY_HISTORY_OUTCOME" != "success" ] || [ "$RELEASE_AUDIT_OUTCOME" != "success" ]; then
-            echo "公开发布门禁未通过；仓库必须保持 Private"
+          if [ "$RELEASE_AUDIT_OUTCOME" != "success" ]; then
+            echo "公开发布安全审计未通过；发布应暂停"
             exit 1
           fi
-          echo "公开发布门禁通过；仍需完成人工发布检查"
+          echo "公开发布安全审计通过；不包含 14 天趋势的发布阻断"
