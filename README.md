@@ -100,12 +100,12 @@ flowchart TD
 | 全新 Python 环境安装 | 已通过 | 在 Python 3.12.12 的隔离虚拟环境中执行 `pip install -r requirements.txt` 与 `pip check`；GitHub Actions 另用全新 Python 3.11 完成依赖安装、`pip check`、SQLite 初始化和健康检查。 |
 | SQLite 初始化与迁移 | 已通过 | 使用隔离 SQLite 执行 `python main.py init`，Alembic 版本为 `91a4d2f7c8b0 (head)`。 |
 | FastAPI 健康检查 | 已通过 | Uvicorn 实际启动后，`GET /health` 返回 HTTP 200；数据库、Scheduler 和 Agent 状态正常。 |
-| Release Smoke Check | 已通过 | GitHub Actions Run `43395018864` 在全新 Ubuntu、Python 3.11、PostgreSQL 16 和 Docker Compose 环境中成功；其中 Docker 任务实际执行 `docker compose up --build --detach`，容器达到 `healthy` 并通过 `/health`。 |
-| 当前启用来源手动 canary | GitHub Actions 5/5 通过（仅手动运行） | Run `43395075522`、Artifact `14022561333`：国务院 29/12000、湖北省 20/7947、武汉市 6/6661、十堰市 5/2851、人社部 6/6040（列表数/首条正文字符数）。本地同时保留 2026-11-13 基线结果。手动运行**不计入**连续天数验收。 |
+| Release Smoke Check | 已通过 | GitHub Actions Run `43430587587` 在全新 Ubuntu、Python 3.11、PostgreSQL 16 和 Docker Compose 环境中成功；其中 Docker 任务实际执行 `docker compose up --build --detach`，容器达到 `healthy` 并通过 `/health`。 |
+| 当前启用来源手动 canary | GitHub Actions 5/5 通过（仅手动运行） | Run `43430807699`、Artifact `14040291339`：国务院 29/12000、湖北省 20/7947、武汉市 5/6661、十堰市 5/2851、人社部 6/6030（列表数/首条正文字符数）。本地同时保留 2026-11-13 基线结果。手动运行**不计入**连续天数验收。 |
 | AI 分析 | 已通过（受控样本） | 在隔离 SQLite 环境中真实采集全部 5 个启用来源并取得 69 条；受控选取 1 条送入流水线，由兼容模型完成全文结构化分析，趋势评分 72，生成日报并落库。该结果只证明受控样本链路。 |
 | 真实通知投递 | 企业微信、邮件已通过；飞书未验证 | 2026-11-13 实际发送企业微信 2/2 分片、邮件 1/1 分片，均无重试，台账状态为 `success`。飞书未配置且未实发，不能记为通过。 |
 | 来源巡检自动化 | 已配置并通过手动 Actions 验证 | `.github/workflows/source-canary.yml` 每日 00:17 UTC（北京时间 08:17）运行，使用固定 5 来源名称、数量、列表数和正文阈值门禁；仅上传脱敏 Manifest。Tavily 是推荐增强项，不是五来源运行的硬依赖。 |
-| 14 个北京时间自然日连续验收 | 未完成 | 截至 2026-11-13，尚无可计入的 `event=schedule` 运行。只有每日至少一次定时运行按固定 5 来源门禁成功，才计为当天通过；失败、缺失或来源不完整会重置连续计数。 |
+| 14 个北京时间自然日连续验收 | 未完成 | 截至 2026-11-13，尚无可计入的 `event=schedule` 运行；Release Gate Run `43431107930` 返回 `complete=false`、`passed_days=0`，符合当前证据不足的预期。只有每日至少一次定时运行按固定 5 来源门禁成功，才计为当天通过；失败、缺失或来源不完整会重置连续计数。 |
 | 敏感信息审计 | 已通过当前 HEAD | 对当前提交和全部可达 Git blob 复扫，未发现高危凭据格式或实际非空配置值的历史命中；最终公开前仍需对发布提交重跑。 |
 | 可公开性 | 被 14 天连续验收阻塞 | 当前为单根 Private 仓库，跟踪树未包含测试、数据库、日志、报告或缓存路径。连续验收、最终对象审计和公开后匿名核验完成前，不得切换为 Public。 |
 
@@ -496,12 +496,12 @@ docker compose down
 - [x] 启动 FastAPI，确认 `/health` 返回 200 且数据库、Scheduler、Agent 状态正常，然后关闭测试进程。
 - [x] 完成一次五来源真实采集和来源结构探针，并记录口径限制。
 - [x] 补充 5 张来自真实数据的脱敏展示图、系统架构图和两项数据流图。
-- [x] GitHub Actions Run `43395018864` 实际通过 PostgreSQL 16 初始化、迁移、读写往返和 API 健康检查。
-- [x] GitHub Actions Run `43395018864` 实际执行 `docker compose up --build --detach` 并检查容器健康与 `/health`。
+- [x] GitHub Actions Run `43430587587` 实际通过 PostgreSQL 16 初始化、迁移、读写往返和 API 健康检查。
+- [x] GitHub Actions Run `43430587587` 实际执行 `docker compose up --build --detach` 并检查容器健康与 `/health`。
 - [x] 使用真实 API 凭据完成一次受控的“采集 → AI 分析 → 报告生成 → 企业微信和邮件通知”链路；采集范围是全部 5 个启用来源，分析样本为 1 条。
 - [ ] 在获得明确授权和测试渠道后，补充真实通知效果截图；Docker 部署截图不作为必需项。
 - [x] 对全部 5 个启用来源连续执行两轮本地列表与首条正文的 `source-canary`，均为 5/5 通过。
-- [x] GitHub Actions 手动 Canary Run `43395075522` / Artifact `14022561333` 完成 5/5 真实来源验收。
+- [x] GitHub Actions 手动 Canary Run `43430807699` / Artifact `14040291339` 完成 5/5 真实来源验收。
 - [x] 每日 canary 采用固定 5 来源门禁，任一来源缺失、改名、列表为空或正文低于阈值时任务失败，并仅上传脱敏 Manifest。
 - [ ] 从 2026-11-14 起完成至少 14 个北京时间自然日的 `event=schedule` 连续成功记录，并更新验收台账。
 - [ ] 对最终发布提交与全部可达对象复扫，确认无 `.env`、数据库、日志、报告、测试文件、临时文件及敏感值。
