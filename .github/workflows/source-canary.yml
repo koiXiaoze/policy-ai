@@ -1,0 +1,71 @@
+name: Government Source Canary
+
+on:
+  schedule:
+    # 每日 00:17 UTC（北京时间 08:17）巡检全部启用来源
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: government-source-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: Verify all enabled government sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      DATABASE_URL: sqlite:///data/source-canary.db
+      NOTIFY_CHANNELS: ""
+      SOURCE_HEALTH_ALERT_ENABLED: "false"
+      AI_API_KEY: ""
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Initialize isolated database
+        run: |
+          mkdir -p reports
+          python main.py init
+          python -m alembic current
+
+      - name: Run all-source canary
+        run: python main.py source-canary --json --output reports/source-canary.json
+
+      - name: Collect source diagnostics
+        if: always()
+        continue-on-error: true
+        run: python main.py source-diagnostics --probe --json > reports/source-diagnostics.json
+
+      - name: Upload canary reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: government-source-canary-${{ github.run_id }}
+          path: reports/*.json
+          if-no-files-found: warn
+          retention-days: 30
