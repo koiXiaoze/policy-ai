@@ -12,6 +12,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -26,6 +27,14 @@ EXPECTED_SOURCE_NAMES = (
 )
 MIN_CONTENT_CHARS = 100
 SCHEMA_VERSION = 1
+MAX_LOG_BYTES = 256 * 1024
+LOG_SENSITIVE_PATTERNS = (
+    ("url", re.compile(r"https?://|\bwww\.", re.IGNORECASE)),
+    ("authorization", re.compile(r"\bauthorization\b", re.IGNORECASE)),
+    ("cookie", re.compile(r"\b(?:set-)?cookie\b", re.IGNORECASE)),
+    ("token", re.compile(r"token", re.IGNORECASE)),
+    ("body", re.compile(r"\b(?:item_body|content_text|request_headers)\b", re.IGNORECASE)),
+)
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
@@ -130,6 +139,28 @@ def _beijing_date(payload: dict[str, Any] | None) -> str:
     return datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
 
 
+def _validate_logs(paths: list[Path]) -> list[str]:
+    """Scan canary logs without echoing matched values or surrounding text."""
+    errors: list[str] = []
+    for path in paths:
+        if not path.exists():
+            errors.append(f"canary log is missing: {path.name}")
+            continue
+        try:
+            size = path.stat().st_size
+            if size > MAX_LOG_BYTES:
+                errors.append(f"canary log exceeds {MAX_LOG_BYTES} bytes: {path.name}")
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            errors.append(f"cannot read canary log {path.name}: {exc.__class__.__name__}")
+            continue
+        for category, pattern in LOG_SENSITIVE_PATTERNS:
+            if pattern.search(text):
+                errors.append(f"canary log contains forbidden {category} pattern: {path.name}")
+    return errors
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -165,11 +196,19 @@ def main() -> int:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--manifest-output", type=Path, required=True)
     parser.add_argument("--summary-output", type=Path)
+    parser.add_argument(
+        "--log",
+        action="append",
+        default=[],
+        type=Path,
+        help="Canary/diagnostic log that must not contain URLs or sensitive fields",
+    )
     args = parser.parse_args()
 
     payload, load_errors = _read_json(args.input)
     validation_errors, sources = _validate(payload)
-    errors = load_errors + validation_errors
+    log_errors = _validate_logs(args.log)
+    errors = load_errors + validation_errors + log_errors
     now = datetime.now(timezone.utc)
     manifest = {
         "schema_version": SCHEMA_VERSION,

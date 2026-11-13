@@ -27,6 +27,7 @@ jobs:
       SOURCE_HEALTH_ALERT_ENABLED: "false"
       AI_API_KEY: ""
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      # Logs from scrapers contain source URLs; keep them out of public Actions logs.
 
     steps:
       - name: Check out repository
@@ -54,25 +55,38 @@ jobs:
           python -m alembic current
 
       # 原始报告仅保留在工作区；即使失败也继续，由校验器判断最终门禁。
+      # stdout/stderr are retained only as workspace logs; the validator checks them.
+      # Raw reports and runtime logs are not uploaded as artifacts.
+      - name: Remove repository env file before canary
+        run: rm -f .env
+
       - name: Run all-source canary
+        env:
+          LOG_LEVEL: "CRITICAL"
         id: canary
         continue-on-error: true
-        run: python main.py source-canary --json --output reports/source-canary.json
+        run: |
+          : > reports/source-canary-run.log
+          python main.py source-canary --json --output reports/source-canary.json \
+            >> reports/source-canary-run.log 2>&1
 
-      # 固定 5 来源门禁：来源名称、数量、状态、列表数与正文阈值全部精确校验。
-      # 校验器只输出脱敏 Manifest，不包含正文、URL、请求头或凭据。
+      - name: Collect source diagnostics
+        if: always()
+        continue-on-error: true
+        run: |
+          python main.py source-diagnostics --probe --json \
+            > reports/source-diagnostics.json 2>> reports/source-canary-run.log
+
+      # Validate the fixed five-source gate and scan logs without echoing matches.
+      # The only emitted artifact is the redacted release manifest.
       - name: Validate fixed-source gate and emit release manifest
         id: validate
         if: always()
         run: |
           python scripts/verify_source_canary.py \
             --input reports/source-canary.json \
-            --manifest-output reports/release-manifest.json
-
-      - name: Collect source diagnostics
-        if: always()
-        continue-on-error: true
-        run: python main.py source-diagnostics --probe --json > reports/source-diagnostics.json
+            --manifest-output reports/release-manifest.json \
+            --log reports/source-canary-run.log
 
       # 仅上传校验器生成的脱敏 Manifest（以及可选的诊断摘要），不上传原始 canary 报告。
       - name: Upload release evidence
