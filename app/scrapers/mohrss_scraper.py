@@ -421,7 +421,7 @@ class MohrssScraper(BaseScraper):
                     "page": str(page_num),
                     "pagesize": str(pagesize),
                 }
-                logger.info("调用 MOHRSS 官方搜索接口 (第 %s 页): %s", page_num, self.search_api_base)
+                logger.info("调用 MOHRSS 官方搜索接口 (第 %s 页)", page_num)
 
                 try:
                     resp = self._request(self.search_api_base, params=params)

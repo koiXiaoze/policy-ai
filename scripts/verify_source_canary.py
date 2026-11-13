@@ -18,6 +18,17 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from app.services.source_canary_diagnostics import (  # noqa: E402
+    ALLOWED_CHANNEL_FAILURES,
+    ALLOWED_ERROR_TYPES,
+    ALLOWED_FAILURE_CATEGORIES,
+)
+
+
 EXPECTED_SOURCE_NAMES = (
     "国务院",
     "湖北省人民政府",
@@ -48,6 +59,83 @@ def _read_json(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
     if not isinstance(payload, dict):
         return None, ["canary report root must be an object"]
     return payload, []
+
+
+def _sanitize_diagnostics(
+    name: str,
+    field: str,
+    raw_values: object,
+    allowed: frozenset[str],
+    errors: list[str],
+) -> list[str]:
+    """Return only fixed diagnostic enums, without echoing rejected values."""
+    if raw_values is None:
+        return []
+    if not isinstance(raw_values, list):
+        errors.append(f"{name}: {field} must be a list")
+        return []
+
+    safe: list[str] = []
+    seen: set[str] = set()
+    for index, value in enumerate(raw_values):
+        if not isinstance(value, str):
+            errors.append(f"{name}: {field} contains non-string value at index {index}")
+            continue
+        if value not in allowed:
+            errors.append(f"{name}: {field} contains invalid value at index {index}")
+            continue
+        if value in seen:
+            errors.append(f"{name}: {field} contains duplicate value at index {index}")
+            continue
+        seen.add(value)
+        safe.append(value)
+    return safe
+
+
+def _sanitize_enum(
+    name: str,
+    field: str,
+    raw_value: object,
+    allowed: frozenset[str],
+    errors: list[str],
+) -> str | None:
+    """Accept only a fixed enum, without echoing arbitrary input."""
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, str) or raw_value not in allowed:
+        errors.append(f"{name}: {field} is invalid")
+        return None
+    return raw_value
+
+
+def _sanitize_error_type(
+    name: str,
+    raw_value: object,
+    errors: list[str],
+) -> str | None:
+    """Accept only a known error enum or a missing value."""
+    return _sanitize_enum(
+        name,
+        "error_type",
+        raw_value,
+        ALLOWED_ERROR_TYPES,
+        errors,
+    )
+
+
+def _sanitize_optional_nonnegative_int(
+    name: str,
+    field: str,
+    raw_value: object,
+    errors: list[str],
+) -> int | None:
+    """Accept a missing value or a non-negative integer; bool is invalid."""
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, int) and not isinstance(raw_value, bool) and raw_value >= 0:
+        return raw_value
+    errors.append(f"{name}: {field} must be a non-negative integer or null")
+    return None
 
 
 def _validate(payload: dict[str, Any] | None) -> tuple[list[str], list[dict[str, Any]]]:
@@ -88,16 +176,71 @@ def _validate(payload: dict[str, Any] | None) -> tuple[list[str], list[dict[str,
             errors.append(f"source entry {index} must be an object")
             continue
         name = raw_source.get("source_name")
-        name_text = name if isinstance(name, str) else f"<invalid-{index}>"
-        observed_names.append(name_text)
+        if isinstance(name, str) and name in EXPECTED_SOURCE_NAMES:
+            name_text = name
+            observed_names.append(name_text)
+        else:
+            name_text = f"<invalid-source-{index}>"
+            errors.append(f"source entry {index}: source_name is invalid")
+        failed_channels = _sanitize_diagnostics(
+            name_text,
+            "failed_channels",
+            raw_source.get("failed_channels"),
+            ALLOWED_CHANNEL_FAILURES,
+            errors,
+        )
+        failure_categories = _sanitize_diagnostics(
+            name_text,
+            "failure_categories",
+            raw_source.get("failure_categories"),
+            ALLOWED_FAILURE_CATEGORIES,
+            errors,
+        )
+        error_type = _sanitize_error_type(
+            name_text,
+            raw_source.get("error_type"),
+            errors,
+        )
         entry = {
             "source_name": name_text,
-            "status": raw_source.get("status"),
-            "fetch_status": raw_source.get("fetch_status"),
-            "item_count": raw_source.get("item_count"),
-            "content_status": raw_source.get("content_status"),
-            "content_chars": raw_source.get("content_chars"),
-            "error_type": raw_source.get("error_type"),
+            "status": _sanitize_enum(
+                name_text,
+                "status",
+                raw_source.get("status"),
+                frozenset({"ok", "failed"}),
+                errors,
+            ),
+            "fetch_status": _sanitize_enum(
+                name_text,
+                "fetch_status",
+                raw_source.get("fetch_status"),
+                frozenset({"ok", "empty", "degraded", "failed", "unknown"}),
+                errors,
+            ),
+            "item_count": _sanitize_optional_nonnegative_int(
+                name_text,
+                "item_count",
+                raw_source.get("item_count", None),
+                errors,
+            ),
+            "content_status": _sanitize_enum(
+                name_text,
+                "content_status",
+                raw_source.get("content_status"),
+                frozenset(
+                    {"ok", "too_short", "empty", "failed", "skipped", "not_checked"}
+                ),
+                errors,
+            ),
+            "content_chars": _sanitize_optional_nonnegative_int(
+                name_text,
+                "content_chars",
+                raw_source.get("content_chars", None),
+                errors,
+            ),
+            "error_type": error_type,
+            "failed_channels": failed_channels,
+            "failure_categories": failure_categories,
         }
         safe_sources.append(entry)
 
@@ -116,11 +259,8 @@ def _validate(payload: dict[str, Any] | None) -> tuple[list[str], list[dict[str,
         errors.append("canary contains duplicate source names")
     if set(observed_names) != set(EXPECTED_SOURCE_NAMES):
         missing = sorted(set(EXPECTED_SOURCE_NAMES) - set(observed_names))
-        unexpected = sorted(set(observed_names) - set(EXPECTED_SOURCE_NAMES))
         if missing:
             errors.append(f"missing fixed sources: {', '.join(missing)}")
-        if unexpected:
-            errors.append(f"unexpected sources: {', '.join(unexpected)}")
     if len(raw_sources) != len(EXPECTED_SOURCE_NAMES):
         errors.append(f"source_count must equal {len(EXPECTED_SOURCE_NAMES)}")
 
@@ -179,13 +319,16 @@ def _markdown(manifest: dict[str, Any]) -> str:
         f"- Event: `{manifest.get('event') or 'local'}`",
         f"- Run: `{manifest.get('run_id') or 'local'}`",
         "",
-        "| Source | Status | Items | Content chars |",
-        "|---|---|---:|---:|",
+        "| Source | Status | Items | Content chars | Failed channels | Failure categories |",
+        "|---|---|---:|---:|---|---|",
     ]
     for source in manifest["sources"]:
+        failed_channels = ", ".join(source.get("failed_channels", [])) or "-"
+        failure_categories = ", ".join(source.get("failure_categories", [])) or "-"
         lines.append(
             f"| {source['source_name']} | {source['status']} | "
-            f"{source['item_count']} | {source['content_chars']} |"
+            f"{source['item_count']} | {source['content_chars']} | "
+            f"{failed_channels} | {failure_categories} |"
         )
     if manifest["validation_errors"]:
         lines.extend(["", "Validation errors:", ""])

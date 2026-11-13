@@ -8,6 +8,7 @@ import json
 import os
 import re
 import random
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -20,10 +21,17 @@ from app.scrapers.base import BaseScraper, ScrapedItem
 from app.scrapers.content_cleaner import clean_title
 from app.scrapers.tavily_client import create_tavily_client
 from app.logger import logger
+from app.services.source_canary_diagnostics import (
+    ALLOWED_CHANNEL_FAILURES,
+    ALLOWED_FAILURE_CATEGORIES,
+)
 
 # Tavily API 配置
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TAVILY_API_BASE = "https://api.tavily.com"
+REQUEST_MAX_ATTEMPTS = 3
+REQUEST_RETRY_BACKOFF_SECONDS = (0.5, 1.5)
+REQUEST_RETRY_STATUSES = {412, 429, 500, 502, 503, 504}
 
 
 class ShiyanScraper(BaseScraper):
@@ -49,6 +57,7 @@ class ShiyanScraper(BaseScraper):
         self.days_back: Optional[int] = source_config.get("days_back")
         self._session = None
         self._failed_channels: List[str] = []
+        self._failure_categories: List[str] = []
 
     def _get_session(self):
         if self._session is None:
@@ -74,7 +83,38 @@ class ShiyanScraper(BaseScraper):
 
     def _request(self, url: str):
         session = self._get_session()
-        return session.get(url, timeout=30, headers=self._random_headers())
+        for attempt in range(REQUEST_MAX_ATTEMPTS):
+            try:
+                response = session.get(
+                    url, timeout=30, headers=self._random_headers()
+                )
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt + 1 >= REQUEST_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "十堰直连请求暂时失败，%s 秒后重试 (%s/%s)",
+                    REQUEST_RETRY_BACKOFF_SECONDS[attempt],
+                    attempt + 1,
+                    REQUEST_MAX_ATTEMPTS,
+                )
+                time.sleep(REQUEST_RETRY_BACKOFF_SECONDS[attempt])
+                continue
+
+            if (
+                response.status_code not in REQUEST_RETRY_STATUSES
+                or attempt + 1 >= REQUEST_MAX_ATTEMPTS
+            ):
+                return response
+            logger.warning(
+                "十堰直连返回 HTTP %s，%s 秒后重试 (%s/%s)",
+                response.status_code,
+                REQUEST_RETRY_BACKOFF_SECONDS[attempt],
+                attempt + 1,
+                REQUEST_MAX_ATTEMPTS,
+            )
+            response.close()
+            time.sleep(REQUEST_RETRY_BACKOFF_SECONDS[attempt])
+        raise RuntimeError("十堰直连重试流程异常结束")
 
     def _list_page_urls(self) -> List[str]:
         """返回配置的全部列表栏目，并对重复地址去重。"""
@@ -176,12 +216,18 @@ class ShiyanScraper(BaseScraper):
 
     def _remember_failed_channel(self, channel: str) -> None:
         """记录固定、可公开的通道失败枚举，不保留异常原文。"""
-        allowed = {"direct_failed", "tavily_failed", "scrapling_failed"}
-        if channel not in allowed:
+        if channel not in ALLOWED_CHANNEL_FAILURES:
             raise ValueError(f"未知在线通道失败类型: {channel}")
         if channel not in self._failed_channels:
             self._failed_channels.append(channel)
         self.last_fetch_error_type = channel
+
+    def _remember_failure_category(self, category: str) -> None:
+        """记录固定失败类别，避免把 URL、异常原文或响应正文带出进程。"""
+        if category not in ALLOWED_FAILURE_CATEGORIES:
+            raise ValueError(f"未知在线失败类别: {category}")
+        if category not in self._failure_categories:
+            self._failure_categories.append(category)
 
     def _failed_page_urls(self, failures: List[str]) -> List[str]:
         """从失败明细中还原失败栏目，避免成功栏目被重复抓取。"""
@@ -259,6 +305,7 @@ class ShiyanScraper(BaseScraper):
         if not TAVILY_API_KEY:
             logger.info("未配置 TAVILY_API_KEY，跳过 Tavily 抓取")
             self._remember_failed_channel("tavily_failed")
+            self._remember_failure_category("not_configured")
             return [], ["Tavily 未配置"]
 
         logger.info("使用 Tavily extract API (advanced) 从列表页面获取十堰市政策...")
@@ -400,6 +447,7 @@ class ShiyanScraper(BaseScraper):
 
         if failures:
             self._remember_failed_channel("tavily_failed")
+            self._remember_failure_category("channel_error")
         if not all_links:
             logger.warning("Tavily extract 无有效结果")
 
@@ -468,6 +516,7 @@ class ShiyanScraper(BaseScraper):
         self.last_fetch_error = None
         self.last_fetch_error_type = None
         self._failed_channels = []
+        self._failure_categories = []
 
         # 1. 直连抓取全部栏目。任一栏目成功都不能掩盖另一个栏目失败：
         # xxgk_zcfg 可能返回 200 但由 JavaScript 在浏览器端加载数据。
@@ -587,6 +636,7 @@ class ShiyanScraper(BaseScraper):
             failures.append(f"Scrapling 初始化失败: {exc}")
         if failures:
             self._remember_failed_channel("scrapling_failed")
+            self._remember_failure_category("channel_error")
         return items, failures
 
     def _fetch_from_database(self) -> List[ScrapedItem]:
@@ -649,15 +699,43 @@ class ShiyanScraper(BaseScraper):
                             if json_error:
                                 reason += f"；{json_error}"
                             failures.append(f"{page_url}: {reason}")
+                            self._remember_failure_category("parse_empty")
                 elif resp.status_code == 412:
                     logger.warning("在线抓取遇到 412 WAF 拦截: %s", page_url)
                     failures.append(f"{page_url}: HTTP 412 WAF 拦截")
-                else:
-                    logger.warning("在线抓取失败: HTTP %s (%s)", resp.status_code, page_url)
+                    self._remember_failure_category("http_412")
+                elif resp.status_code == 429:
+                    logger.warning("在线抓取被限流: HTTP 429 (%s)", page_url)
+                    failures.append(f"{page_url}: HTTP 429")
+                    self._remember_failure_category("http_429")
+                elif 500 <= resp.status_code <= 599:
+                    logger.warning(
+                        "在线抓取遇到服务端错误: HTTP %s (%s)",
+                        resp.status_code,
+                        page_url,
+                    )
                     failures.append(f"{page_url}: HTTP {resp.status_code}")
+                    self._remember_failure_category("http_5xx")
+                else:
+                    logger.warning(
+                        "在线抓取失败: HTTP %s (%s)",
+                        resp.status_code,
+                        page_url,
+                    )
+                    failures.append(f"{page_url}: HTTP {resp.status_code}")
+                    self._remember_failure_category("http_other")
+            except requests.Timeout:
+                logger.warning("在线抓取超时: %s", page_url)
+                failures.append(f"{page_url}: 请求超时")
+                self._remember_failure_category("timeout")
+            except requests.ConnectionError:
+                logger.warning("在线抓取连接失败: %s", page_url)
+                failures.append(f"{page_url}: 连接失败")
+                self._remember_failure_category("connection_error")
             except Exception as exc:
                 logger.warning("在线抓取异常 %s: %s", page_url, exc)
                 failures.append(f"{page_url}: {exc}")
+                self._remember_failure_category("transport_error")
 
         if not items and failures:
             self.last_fetch_error = self._failure_reason("在线通道", failures)

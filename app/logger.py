@@ -11,6 +11,14 @@ from pathlib import Path
 from app.config import settings
 
 
+THIRD_PARTY_LOGGERS = ("scrapling", "urllib3", "urllib3.connectionpool")
+
+
+def _configured_level() -> int:
+    """Return the shared log level, falling back to INFO for bad input."""
+    return getattr(logging, settings.log_level.upper(), logging.INFO)
+
+
 def setup_logger(name: str = "pia") -> logging.Logger:
     """配置并返回日志记录器
     
@@ -21,8 +29,23 @@ def setup_logger(name: str = "pia") -> logging.Logger:
         配置好的 Logger 实例
     """
     logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, settings.log_level.upper(), logging.INFO))
+    level = _configured_level()
+    logger.setLevel(level)
 
+    # Scrapling and urllib3 may install their own handlers and emit request
+    # URLs at INFO/WARNING. Close these loggers unconditionally: their handlers
+    # bypass the application logger's filtering, and request URLs can contain
+    # credentials or internal endpoints. Application diagnostics remain on the
+    # project logger.
+    for third_party_name in THIRD_PARTY_LOGGERS:
+        third_party_logger = logging.getLogger(third_party_name)
+        third_party_logger.setLevel(logging.CRITICAL + 1)
+        third_party_logger.disabled = True
+
+    # A dependency may install its own handler during import, so setting only
+    # individual logger levels does not reliably suppress propagated records.
+    # Enforce the configured application level as the process-wide ceiling.
+    logging.disable(level - 1)
     if logger.handlers:
         return logger
 

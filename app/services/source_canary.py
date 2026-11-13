@@ -13,6 +13,11 @@ from app.config import get_enabled_sources
 from app.logger import logger
 from app.notifiers.safety import redact_sensitive_text
 from app.scrapers.factory import create_scraper
+from app.services.source_canary_diagnostics import (
+    ALLOWED_CHANNEL_FAILURES,
+    ALLOWED_FAILURE_CATEGORIES,
+    filter_diagnostic_values,
+)
 
 
 class SourceCanaryService:
@@ -40,6 +45,9 @@ class SourceCanaryService:
             content_chars = None
             error = None
             error_type = None
+            failed_channels: List[str] = []
+            failure_categories: List[str] = []
+            scraper = None
 
             try:
                 scraper = create_scraper(source_config)
@@ -52,6 +60,14 @@ class SourceCanaryService:
                 raw_error = getattr(scraper, "last_fetch_error", None)
                 error = redact_sensitive_text(raw_error) if raw_error else None
                 error_type = getattr(scraper, "last_fetch_error_type", None)
+                failed_channels = filter_diagnostic_values(
+                    getattr(scraper, "_failed_channels", []),
+                    ALLOWED_CHANNEL_FAILURES,
+                )
+                failure_categories = filter_diagnostic_values(
+                    getattr(scraper, "_failure_categories", []),
+                    ALLOWED_FAILURE_CATEGORIES,
+                )
 
                 if check_content:
                     if items:
@@ -84,6 +100,15 @@ class SourceCanaryService:
                             error = error or "来源未声明可信的在线采集状态"
                             error_type = error_type or "unverified_fetch_status"
             except Exception as exc:
+                if scraper is not None:
+                    failed_channels = filter_diagnostic_values(
+                        getattr(scraper, "_failed_channels", []),
+                        ALLOWED_CHANNEL_FAILURES,
+                    )
+                    failure_categories = filter_diagnostic_values(
+                        getattr(scraper, "_failure_categories", []),
+                        ALLOWED_FAILURE_CATEGORIES,
+                    )
                 error = redact_sensitive_text(exc) or exc.__class__.__name__
                 logger.error(
                     "来源 canary 异常: %s (%s: %s)",
@@ -117,6 +142,8 @@ class SourceCanaryService:
                 "content_chars": content_chars,
                 "error": error,
                 "error_type": error_type,
+                "failed_channels": failed_channels,
+                "failure_categories": failure_categories,
             }
             results.append(result)
 
