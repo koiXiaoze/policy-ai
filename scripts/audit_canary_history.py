@@ -519,14 +519,17 @@ def _window_days(end: date) -> list[date]:
     return [start + timedelta(days=offset) for offset in range(WINDOW_DAYS)]
 
 
-def _earliest_release_date(days: list[dict[str, Any]], end: date) -> str:
-    """Return the end date when complete, else end plus missing trailing days."""
-    trailing = 0
-    for item in reversed(days):
-        if item.get("status") != "passed":
-            break
-        trailing += 1
-    return (end + timedelta(days=WINDOW_DAYS - trailing)).isoformat()
+def _earliest_release_date(days: list[dict[str, Any]], end: date) -> str | None:
+    """Return the window end only after every day has release evidence.
+
+    Missing scheduled runs are not equivalent to future passes. Calendar
+    arithmetic cannot establish when GitHub will next schedule, complete, or
+    successfully audit the missing days, so an incomplete window has no
+    evidence-backed release date.
+    """
+    if len(days) != WINDOW_DAYS or any(item.get("status") != "passed" for item in days):
+        return None
+    return end.isoformat()
 
 
 def _write_report(path: Path, payload: dict[str, Any]) -> None:

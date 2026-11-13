@@ -48,6 +48,7 @@ class ShiyanScraper(BaseScraper):
         self.headers = dict(self.base_headers)
         self.days_back: Optional[int] = source_config.get("days_back")
         self._session = None
+        self._failed_channels: List[str] = []
 
     def _get_session(self):
         if self._session is None:
@@ -173,6 +174,15 @@ class ShiyanScraper(BaseScraper):
             detail += f"；另有 {len(failures) - 4} 个栏目失败"
         return f"{channel}部分列表栏目采集失败: {detail}"
 
+    def _remember_failed_channel(self, channel: str) -> None:
+        """记录固定、可公开的通道失败枚举，不保留异常原文。"""
+        allowed = {"direct_failed", "tavily_failed", "scrapling_failed"}
+        if channel not in allowed:
+            raise ValueError(f"未知在线通道失败类型: {channel}")
+        if channel not in self._failed_channels:
+            self._failed_channels.append(channel)
+        self.last_fetch_error_type = channel
+
     def _failed_page_urls(self, failures: List[str]) -> List[str]:
         """从失败明细中还原失败栏目，避免成功栏目被重复抓取。"""
         failed: List[str] = []
@@ -192,7 +202,6 @@ class ShiyanScraper(BaseScraper):
             timeout=timeout,
             max_retries=max_retries,
         )
-        self.last_fetch_error_type = result.error_type if not result.ok else None
         return result.data
 
     def _tavily_extract(self, url: str, depth: str = "advanced") -> Optional[dict]:
@@ -249,6 +258,7 @@ class ShiyanScraper(BaseScraper):
         """调用 Tavily；可只补抓指定栏目，返回合并结果和失败栏目。"""
         if not TAVILY_API_KEY:
             logger.info("未配置 TAVILY_API_KEY，跳过 Tavily 抓取")
+            self._remember_failed_channel("tavily_failed")
             return [], ["Tavily 未配置"]
 
         logger.info("使用 Tavily extract API (advanced) 从列表页面获取十堰市政策...")
@@ -388,6 +398,8 @@ class ShiyanScraper(BaseScraper):
                 logger.warning("Tavily extract 页面失败 %s: %s", page_url, exc)
                 failures.append(f"{page_url}: {exc}")
 
+        if failures:
+            self._remember_failed_channel("tavily_failed")
         if not all_links:
             logger.warning("Tavily extract 无有效结果")
 
@@ -453,6 +465,9 @@ class ShiyanScraper(BaseScraper):
 
     def fetch(self) -> List[ScrapedItem]:
         logger.info("开始采集: %s", self.name)
+        self.last_fetch_error = None
+        self.last_fetch_error_type = None
+        self._failed_channels = []
 
         # 1. 直连抓取全部栏目。任一栏目成功都不能掩盖另一个栏目失败：
         # xxgk_zcfg 可能返回 200 但由 JavaScript 在浏览器端加载数据。
@@ -522,6 +537,9 @@ class ShiyanScraper(BaseScraper):
                 self._mark_live_success()
             return items
 
+        # 所有在线通道均未取得条目；后续本地/数据库数据只能标记为降级。
+        self.last_fetch_error_type = "all_channels_failed"
+
         # 3. 本地文件回退
         logger.warning("Tavily API 失败，尝试本地文件回退")
         items = self._fetch_from_local()
@@ -567,6 +585,8 @@ class ShiyanScraper(BaseScraper):
         except Exception as exc:
             logger.warning("Scrapling 通道失败: %s", exc)
             failures.append(f"Scrapling 初始化失败: {exc}")
+        if failures:
+            self._remember_failed_channel("scrapling_failed")
         return items, failures
 
     def _fetch_from_database(self) -> List[ScrapedItem]:
@@ -641,6 +661,8 @@ class ShiyanScraper(BaseScraper):
 
         if not items and failures:
             self.last_fetch_error = self._failure_reason("在线通道", failures)
+        if failures:
+            self._remember_failed_channel("direct_failed")
         return items, failures
 
     @staticmethod

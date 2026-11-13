@@ -142,7 +142,7 @@ python scripts/audit_public_release.py `
   --json-output reports/public-release-audit.json
 ```
 
-两个脚本的退出码均为：`0` 表示完整通过；`1` 表示证据不足或安全门禁失败；`2` 表示 API、格式、网络或报告写入异常。自动 Release Gate 每日 01:17 UTC（北京时间 09:17）审计截至昨日的 14 天窗口。若 2026-11-27 当天的 Canary 已完成且需要将当天计入窗口，应在当日手动指定窗口结束日：
+两个脚本的退出码均为：`0` 表示完整通过；`1` 表示证据不足或安全门禁失败；`2` 表示 API、格式、网络或报告写入异常。Canary 审计仅在 14 天证据全部通过时才在 `earliest_release_date` 返回已审计窗口结束日；空窗口或部分窗口返回 `null`，不会根据当前日期推测未来发布日期。自动 Release Gate 每日 01:17 UTC（北京时间 09:17）审计截至昨日的 14 天窗口。若 2026-11-27 当天的 Canary 已完成且需要将当天计入窗口，应在当日手动指定窗口结束日：
 
 ```powershell
 python scripts/audit_canary_history.py `
