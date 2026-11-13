@@ -8,6 +8,8 @@ matched content are never emitted.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import json
 import re
 import subprocess
 import sys
@@ -125,13 +127,23 @@ def _is_forbidden_path(path: str) -> bool:
     return False
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rev", default="HEAD")
-    parser.add_argument("--env-file", type=Path, default=Path(".env"))
-    args = parser.parse_args()
+def _remote_refs() -> list[str]:
+    output = _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/remotes/origin",
+    ).decode("utf-8", errors="replace")
+    refs = []
+    for ref in output.splitlines():
+        if not ref or ref == "refs/remotes/origin/HEAD":
+            continue
+        refs.append(ref)
+    if not refs:
+        raise RuntimeError("no origin remote refs found")
+    return sorted(refs)
 
-    revision = args.rev
+
+def _audit_revision(revision: str, env_file: Path) -> bool:
     commit_sha = _git("rev-parse", revision).decode().strip()
     current_paths = _current_paths(revision)
     objects = _history_objects(revision)
@@ -160,7 +172,7 @@ def main() -> int:
                 if not pattern.search(scrubbed):
                     continue
             blob_hits.add((path or object_sha, category))
-    env_values = _sensitive_env_values(args.env_file)
+    env_values = _sensitive_env_values(env_file)
     env_hits: set[str] = set()
     if env_values:
         content_blobs: list[tuple[str, bytes]] = []
@@ -198,7 +210,62 @@ def main() -> int:
     for category in sorted(commit_hits):
         print(f"COMMIT_MESSAGE_HIT {category}")
     print("Result: FAIL" if failures else "Result: PASS")
-    return 1 if failures else 0
+    return not failures
+
+
+def _write_report(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rev", default="HEAD")
+    parser.add_argument("--all-remote-refs", action="store_true")
+    parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--json-output", type=Path)
+    args = parser.parse_args()
+
+    if args.all_remote_refs and args.rev != "HEAD":
+        parser.error("--rev cannot be combined with --all-remote-refs")
+
+    try:
+        revisions = _remote_refs() if args.all_remote_refs else [args.rev]
+        results = [(revision, _audit_revision(revision, args.env_file)) for revision in revisions]
+    except (RuntimeError, subprocess.CalledProcessError, UnicodeError, OSError) as exc:
+        print(f"Audit setup failed: {exc.__class__.__name__}", file=sys.stderr)
+        return 2
+
+    passed = sum(result for _, result in results)
+    overall_passed = passed == len(results)
+    if args.json_output:
+        try:
+            _write_report(
+                args.json_output,
+                {
+                    "schema_version": 1,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "mode": "all-origin-refs" if args.all_remote_refs else "revision",
+                    "ref_count": len(results),
+                    "passed_count": passed,
+                    "overall_result": "pass" if overall_passed else "fail",
+                    "revisions": [
+                        {"ref": revision, "result": "pass" if result else "fail"}
+                        for revision, result in results
+                    ],
+                },
+            )
+        except OSError as exc:
+            print(f"Audit report write failed: {exc.__class__.__name__}", file=sys.stderr)
+            return 2
+
+    print(f"Remote refs audited: {len(results)}")
+    print(f"Remote refs passed: {passed}")
+    print("Overall result: PASS" if overall_passed else "Overall result: FAIL")
+    return 0 if overall_passed else 1
 
 
 if __name__ == "__main__":

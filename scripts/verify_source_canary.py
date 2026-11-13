@@ -27,6 +27,7 @@ EXPECTED_SOURCE_NAMES = (
 )
 MIN_CONTENT_CHARS = 100
 SCHEMA_VERSION = 1
+WINDOW_DAYS = 14
 MAX_LOG_BYTES = 256 * 1024
 LOG_SENSITIVE_PATTERNS = (
     ("url", re.compile(r"https?://|\bwww\.", re.IGNORECASE)),
@@ -223,6 +224,7 @@ def main() -> int:
         "ref_name": __import__("os").environ.get("GITHUB_REF_NAME", "local"),
         "expected_source_names": list(EXPECTED_SOURCE_NAMES),
         "source_count": len(sources),
+        "window_days": WINDOW_DAYS,
         "sources": sources,
         "validation_errors": errors,
     }

@@ -1,0 +1,87 @@
+name: Public Release Gate
+
+"on":
+  schedule:
+    # 每日 01:17 UTC（北京时间 09:17）审计截至昨日的 14 天窗口
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: public-release-gate
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Audit canary history and public release safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PYTHONUTF8: "1"
+      GITHUB_TOKEN: ${{ github.token }}
+      CANARY_REPORT: reports/canary-history-audit.json
+      RELEASE_REPORT: reports/public-release-audit.json
+
+    steps:
+      - name: Check out full repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all origin branches
+        run: git fetch --prune origin "+refs/heads/*:refs/remotes/origin/*"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Prepare reports directory
+        run: mkdir -p reports
+
+      - name: Audit 14-day scheduled canary window
+        id: canary_history
+        continue-on-error: true
+        run: >-
+          python scripts/audit_canary_history.py
+          --repo "$GITHUB_REPOSITORY"
+          --token-env GITHUB_TOKEN
+          --output "$CANARY_REPORT"
+
+      - name: Audit final commit and all origin refs
+        id: release_audit
+        continue-on-error: true
+        run: >-
+          python scripts/audit_public_release.py
+          --all-remote-refs
+          --env-file .env.example
+          --json-output "$RELEASE_REPORT"
+
+      - name: Upload redacted audit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-release-audit-${{ github.run_id }}
+          path: |
+            reports/canary-history-audit.json
+            reports/public-release-audit.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce both release gates
+        if: always()
+        env:
+          CANARY_HISTORY_OUTCOME: ${{ steps.canary_history.outcome }}
+          RELEASE_AUDIT_OUTCOME: ${{ steps.release_audit.outcome }}
+        run: |
+          echo "canary_history_outcome=$CANARY_HISTORY_OUTCOME"
+          echo "release_audit_outcome=$RELEASE_AUDIT_OUTCOME"
+          if [ "$CANARY_HISTORY_OUTCOME" != "success" ] || [ "$RELEASE_AUDIT_OUTCOME" != "success" ]; then
+            echo "公开发布门禁未通过；仓库必须保持 Private"
+            exit 1
+          fi
+          echo "公开发布门禁通过；仍需完成人工发布检查"

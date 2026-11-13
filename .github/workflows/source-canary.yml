@@ -55,8 +55,7 @@ jobs:
           python -m alembic current
 
       # 原始报告仅保留在工作区；即使失败也继续，由校验器判断最终门禁。
-      # stdout/stderr are retained only as workspace logs; the validator checks them.
-      # Raw reports and runtime logs are not uploaded as artifacts.
+      # 原始报告和运行日志不上传；公开 Actions 日志仅保留校验器输出的脱敏摘要。
       - name: Remove repository env file before canary
         run: rm -f .env
 
