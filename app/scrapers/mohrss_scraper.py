@@ -589,7 +589,7 @@ class MohrssScraper(BaseScraper):
                     'site:mohrss.gov.cn/xxgk2020/zcwjk filetype:html',
                     'site:mohrss.gov.cn "规范性文件"',
                     'site:mohrss.gov.cn "政策文件"',
-                    'site:mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/gfxwj',
+                    'site:www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/gfxwj 规范性文件',
                 ]
                 for query in queries:
                     data = self._tavily_search(query, 20)
