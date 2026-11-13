@@ -11,6 +11,7 @@ import time
 import random
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,6 +24,22 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TAVILY_API_BASE = "https://api.tavily.com"
 MOHRSS_MIN_CONTENT_LENGTH = 100
 MOHRSS_MAX_CONTENT_LENGTH = 12000
+MOHRSS_ALLOWED_HOSTS = frozenset({"www.mohrss.gov.cn"})
+_MOHRSS_WAF_MARKERS = (
+    "function a(a)",
+    "__tst_status",
+    "访问验证",
+    "安全验证",
+    "人机验证",
+)
+_MOHRSS_POLICY_TITLE_KEYWORDS = (
+    "通知", "意见", "办法", "规定", "决定", "公告", "方案", "细则",
+    "规划", "条例", "批复", "指南", "标准", "规则",
+)
+_MOHRSS_NON_POLICY_TITLE_KEYWORDS = (
+    "解读", "图解", "问答", "一图读懂", "新闻", "动态", "招聘", "招考",
+    "考试", "直播", "访谈", "视频", "图片", "名单", "公示", "采购",
+)
 _MOHRSS_CONTENT_BOUNDARY_RE = re.compile(
     r"字体\s*[：:]\s*\[\s*大\s*中\s*小\s*\]"
 )
@@ -170,13 +187,27 @@ class MohrssScraper(BaseScraper):
             "search_depth": "advanced", "include_raw_content": True
         })
 
+    @staticmethod
+    def _is_waf_challenge_text(text: str) -> bool:
+        """识别返回 HTTP 200 但实际为 WAF/人机挑战的空壳页面。"""
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(marker.lower() in lowered for marker in _MOHRSS_WAF_MARKERS)
+
     def _is_valid_policy_url(self, url: str) -> bool:
-        """校验 URL 是否为有效的政策详情页"""
-        if not url or "mohrss.gov.cn" not in url:
+        """校验 URL 是否为 MOHRSS 主站的有效政策详情页。"""
+        if not url:
+            return False
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if (parsed.hostname or "").lower() not in MOHRSS_ALLOWED_HOSTS:
             return False
         # 过滤明确的解读页面；不能用 "jd" 子串，否则会误伤 xgfzjd 等合法路径。
         interpretation_paths = ("/zcjd/", "/zhengcejiedu/", "/interpret/")
-        if "解读" in url or any(path in url.lower() for path in interpretation_paths):
+        path_lower = parsed.path.lower()
+        if "解读" in parsed.path or any(path in path_lower for path in interpretation_paths):
             return False
         # 多种详情页格式
         patterns = [
@@ -186,9 +217,46 @@ class MohrssScraper(BaseScraper):
             r"t\d{8}_\d+\.html",         # t20260724_580859.html
         ]
         for pat in patterns:
-            if re.search(pat, url):
+            if re.search(pat, parsed.path):
                 return True
         logger.debug("URL 格式不符合政策详情页: %s", url)
+        return False
+
+    def _is_policy_discovery_title(self, title: str) -> bool:
+        """Tavily 发现结果必须同时像政策标题且不是常见非政策内容。"""
+        normalized = (title or "").strip()
+        if not normalized:
+            return False
+        if self._is_interpretation_page(normalized):
+            return False
+        if any(word in normalized for word in _MOHRSS_NON_POLICY_TITLE_KEYWORDS):
+            return False
+        return any(word in normalized for word in _MOHRSS_POLICY_TITLE_KEYWORDS)
+
+    @staticmethod
+    def _search_result_has_structure(soup: BeautifulSoup) -> bool:
+        """数据表及 td-date 同时存在，才可作为可信搜索结果结构。"""
+        for table in soup.find_all("table"):
+            classes = table.get("class") or []
+            if "i_nav" in classes:
+                continue
+            if table.find("td", class_="td-date"):
+                return True
+        return False
+
+    def _list_page_has_structure(self, soup: BeautifulSoup) -> bool:
+        """列表页至少包含一个受支持的官方政策详情链接。"""
+        html_text = str(soup)
+        patterns = [
+            r'href=["\']([^"\']+?/\d{6}/t\d{8}_[^"\']*?)["\']',
+            r'href=["\']([^"\']+?/t\d{8}_[^"\']*?)["\']',
+            r'href=["\']([^"\']+?/\d{4}/\d{2}/\d{2}/[^"\']*?)["\']',
+        ]
+        for pattern in patterns:
+            for href in re.findall(pattern, html_text):
+                candidate = self._clean_and_normalize_url(href)
+                if self._is_valid_policy_url(candidate):
+                    return True
         return False
 
     def _is_interpretation_page(self, title: str) -> bool:
@@ -301,9 +369,9 @@ class MohrssScraper(BaseScraper):
                                     pub_time = self._extract_date_from_text(title, url)
                                 
                                 # 日期筛选
-                                if self.days_back and pub_time:
-                                    if (datetime.now() - pub_time).days > self.days_back:
-                                        logger.debug("政策过期跳过: %s (发布: %s)", title[:30], pub_time)
+                                if self.days_back:
+                                    if not pub_time or (datetime.now() - pub_time).days > self.days_back:
+                                        logger.debug("政策日期缺失或过期，跳过: %s (发布: %s)", title[:30], pub_time)
                                     else:
                                         items.append(ScrapedItem(
                                             title=title,
@@ -333,17 +401,19 @@ class MohrssScraper(BaseScraper):
         return items
 
     def _fetch_from_search_api(self) -> Tuple[List[ScrapedItem], bool]:
-        """使用 MOHRSS 官方搜索接口获取政策列表 - 支持分页
-        返回: (items, api_succeeded) - api_succeeded=True 表示接口调用成功（即使0条数据也是成功）
+        """使用 MOHRSS 官方搜索接口获取政策列表。
+
+        api_succeeded 只有在确认数据表结构后才为 True。HTTP 200 的 WAF 页面、
+        空壳页面或结构变化均视为失败，避免把故障误报成合法的空结果。
         """
         all_items = []
-        max_pages = 10  # 最多抓取 10 页
+        max_pages = 10
         pagesize = 50
         api_succeeded = False
-        
+        self.last_fetch_error_type = None
+
         try:
             for page_num in range(1, max_pages + 1):
-                # 构建分页 URL
                 params = {
                     "channelid": "203464",
                     "orderby": "date",
@@ -351,52 +421,76 @@ class MohrssScraper(BaseScraper):
                     "page": str(page_num),
                     "pagesize": str(pagesize),
                 }
-                full_url = self.search_api_base
-                logger.info("调用 MOHRSS 官方搜索接口 (第 %s 页): %s", page_num, full_url)
+                logger.info("调用 MOHRSS 官方搜索接口 (第 %s 页): %s", page_num, self.search_api_base)
 
-                resp = self._request(full_url, params=params)
+                try:
+                    resp = self._request(self.search_api_base, params=params)
+                except Exception as exc:
+                    self.last_fetch_error_type = "transport_error"
+                    logger.warning("MOHRSS 搜索接口传输失败: %s", exc)
+                    break
 
                 if resp.status_code != 200:
+                    if resp.status_code in {403, 412, 429}:
+                        self.last_fetch_error_type = "waf_challenge"
+                    elif resp.status_code >= 500:
+                        self.last_fetch_error_type = "server_error"
+                    else:
+                        self.last_fetch_error_type = "http_error"
                     logger.warning("搜索接口第 %s 页返回状态码: %s", page_num, resp.status_code)
                     break
-                
-                # 标记 API 调用成功（收到 200 响应）
-                api_succeeded = True
 
-                # 解析 HTML 表格
-                soup = BeautifulSoup(resp.text, "lxml")
-                page_items = self._parse_search_results_page(soup, page_num)
-                
-                if not page_items:
-                    logger.info("第 %s 页无数据，停止分页", page_num)
+                resp.encoding = resp.apparent_encoding or "utf-8"
+                if self._is_waf_challenge_text(resp.text):
+                    self.last_fetch_error_type = "waf_challenge"
+                    logger.warning("搜索接口第 %s 页返回 HTTP 200，但内容为 WAF/挑战页面", page_num)
                     break
-                
+
+                soup = BeautifulSoup(resp.text, "lxml")
+                if not self._search_result_has_structure(soup):
+                    self.last_fetch_error_type = "schema_changed"
+                    logger.warning("搜索接口第 %s 页缺少可信数据表结构", page_num)
+                    break
+
+                # 只有确认列表结构后，才承认此次在线调用有效。
+                api_succeeded = True
+                page_items = self._parse_search_results_page(soup, page_num)
+
+                if not page_items:
+                    logger.info("第 %s 页结构有效但日期窗口内无条目，停止分页", page_num)
+                    break
+
                 all_items.extend(page_items)
-                
-                # 如果返回数量少于 pagesize，说明已到最后一页
                 if len(page_items) < pagesize:
                     logger.info("第 %s 页数据少于 pagesize，已到最后一页", page_num)
                     break
-                
-                # 礼貌延迟
+
                 time.sleep(0.5)
 
             logger.info("搜索接口总计解析: %s 条", len(all_items))
 
         except Exception as e:
+            self.last_fetch_error_type = "parse_failed"
             logger.warning("MOHRSS 搜索接口异常: %s", e)
             import traceback
             logger.debug(traceback.format_exc())
 
+        if all_items:
+            self.last_fetch_error_type = None
         return all_items, api_succeeded
 
     def fetch(self) -> List[ScrapedItem]:
         logger.info("开始采集 人力资源和社会保障部 政策列表...")
         all_items = []
-        # 任一在线通道收到可解析响应即视为在线成功；若最终仍为 0 条，
-        # 应记录 empty，而不是把网络/WAF 失败误报为空结果。
         online_succeeded = False
         errors = []
+        error_types = []
+
+        def remember_error(message: str, error_type: Optional[str]) -> None:
+            if message:
+                errors.append(message)
+            if error_type:
+                error_types.append(error_type)
 
         # ========== Level 1: MOHRSS 官方搜索接口（优先，支持分页）==========
         items, api_succeeded = self._fetch_from_search_api()
@@ -407,7 +501,12 @@ class MohrssScraper(BaseScraper):
             self._mark_live_success()
             return all_items
         if api_succeeded:
-            logger.info("官方搜索接口成功但无数据，继续尝试在线列表页")
+            logger.info("官方搜索接口结构有效但无日期窗口内数据，继续尝试在线列表页")
+        else:
+            remember_error(
+                "官方搜索接口未返回可信列表结构",
+                self.last_fetch_error_type or "schema_changed",
+            )
 
         # ========== Level 2: 在线抓取列表页（搜索接口无数据时兜底）==========
         logger.info("尝试在线抓取列表页: %s", self.list_url)
@@ -415,50 +514,72 @@ class MohrssScraper(BaseScraper):
             resp = self._request(self.list_url)
             if resp.status_code == 200:
                 resp.encoding = resp.apparent_encoding or "utf-8"
-                # 可解析的 200 页面即代表在线通道成功；WAF 挑战页不算成功。
-                if "function a(a)" in resp.text or "__tst_status" in resp.text or len(resp.text) < 5000:
+                if self._is_waf_challenge_text(resp.text):
                     logger.warning("检测到 WAF/挑战页面，跳过列表页解析")
-                    errors.append("列表页返回 WAF/挑战页面")
+                    remember_error("列表页返回 WAF/挑战页面", "waf_challenge")
                 else:
-                    online_succeeded = True
                     soup = BeautifulSoup(resp.text, "lxml")
-                    items = self._parse_list_page(soup, self.list_url)
-                    all_items.extend(items)
-                    logger.info("在线抓取列表页成功: %s 条", len(items))
-                    if items:
-                        self._mark_live_success()
-                        return all_items
+                    if self._list_page_has_structure(soup):
+                        online_succeeded = True
+                        items = self._parse_list_page(soup, self.list_url)
+                        all_items.extend(items)
+                        logger.info("在线列表页结构有效，解析到 %s 条", len(items))
+                        if items:
+                            self._mark_live_success()
+                            return all_items
+                    else:
+                        logger.warning("列表页缺少可信政策列表结构")
+                        remember_error("列表页缺少可信政策列表结构", "schema_changed")
             else:
-                errors.append(f"列表页 HTTP {resp.status_code}")
+                error_type = (
+                    "waf_challenge"
+                    if resp.status_code in {403, 412, 429}
+                    else "server_error"
+                    if resp.status_code >= 500
+                    else "http_error"
+                )
+                remember_error(f"列表页 HTTP {resp.status_code}", error_type)
                 if resp.status_code == 412:
                     logger.warning("在线抓取遇到 412 WAF 拦截")
         except Exception as e:
             logger.warning("在线抓取列表页异常: %s", e)
-            errors.append(f"列表页异常: {e}")
+            remember_error(f"列表页异常: {e}", "transport_error")
 
         # ========== Level 3: Tavily Extract API (列表页) ==========
         if not all_items and TAVILY_API_KEY:
             try:
                 logger.info("使用 Tavily Extract API 获取列表页内容")
                 extract_data = self._tavily_extract(self.list_url, "advanced")
-                if extract_data is not None:
-                    online_succeeded = True
-                if extract_data and extract_data.get("results"):
-                    for r in extract_data["results"]:
-                        content = r.get("raw_content", r.get("content", ""))
-                        if content:
-                            soup = BeautifulSoup(content, "lxml")
+                if not extract_data or not extract_data.get("results"):
+                    remember_error(
+                        "Tavily Extract 未返回可用列表内容",
+                        self.last_fetch_error_type or "tavily_empty",
+                    )
+                else:
+                    extract_found_structure = False
+                    for result in extract_data["results"]:
+                        content = result.get("raw_content", result.get("content", ""))
+                        if not content:
+                            continue
+                        soup = BeautifulSoup(content, "lxml")
+                        if self._list_page_has_structure(soup):
+                            extract_found_structure = True
                             items = self._parse_list_page(soup, self.list_url)
                             all_items.extend(items)
-                    logger.info("Tavily Extract 成功: %s 条", len(all_items))
-                    if all_items:
-                        self._mark_live_success()
-                        return all_items
-                else:
-                    logger.info("Tavily Extract 成功但无数据")
+                    if extract_found_structure:
+                        online_succeeded = True
+                        logger.info("Tavily Extract 列表结构有效，解析到 %s 条", len(all_items))
+                        if all_items:
+                            self._mark_live_success()
+                            return all_items
+                    else:
+                        remember_error(
+                            "Tavily Extract 内容缺少可信政策列表结构",
+                            "schema_changed",
+                        )
             except Exception as e:
                 logger.warning("Tavily Extract 失败: %s", e)
-                errors.append(f"Tavily Extract 异常: {e}")
+                remember_error(f"Tavily Extract 异常: {e}", "tavily_error")
 
         # ========== Level 4: Tavily Search API ==========
         if not all_items and TAVILY_API_KEY:
@@ -470,34 +591,53 @@ class MohrssScraper(BaseScraper):
                     'site:mohrss.gov.cn "政策文件"',
                     'site:mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/gfxwj',
                 ]
-                for q in queries:
-                    data = self._tavily_search(q, 20)
-                    if data is not None:
+                for query in queries:
+                    data = self._tavily_search(query, 20)
+                    if not data:
+                        remember_error(
+                            "Tavily Search 未返回数据",
+                            self.last_fetch_error_type or "tavily_empty",
+                        )
+                        continue
+                    if not data.get("results"):
+                        remember_error("Tavily Search 结果为空", "tavily_empty")
+                        continue
+
+                    query_found_candidate = False
+                    for result in data["results"]:
+                        url = result.get("url", "")
+                        title = result.get("title", "")
+                        if not self._is_valid_policy_url(url):
+                            continue
+                        if not self._is_policy_discovery_title(title):
+                            continue
+                        pub_time = self._extract_date_from_text(
+                            title + " " + result.get("content", ""), url
+                        )
+                        # 配置了时间窗口时必须取得可验证日期，不能用无日期结果凑数。
+                        if self.days_back and (
+                            not pub_time or (datetime.now() - pub_time).days > self.days_back
+                        ):
+                            continue
+                        query_found_candidate = True
+                        all_items.append(ScrapedItem(
+                            title=title,
+                            url=url,
+                            source_name=self.name,
+                            government_level=self.level,
+                            department=self.config.get("department", ""),
+                            city=self.city,
+                            publish_time=pub_time,
+                        ))
+
+                    if query_found_candidate:
                         online_succeeded = True
-                    if data and data.get("results"):
-                        for r in data["results"]:
-                            url = r.get("url", "")
-                            title = r.get("title", "")
-                            if self._is_valid_policy_url(url):
-                                pub_time = self._extract_date_from_text(title + " " + r.get("content", ""), url)
-                                if self.days_back and pub_time:
-                                    if (datetime.now() - pub_time).days > self.days_back:
-                                        continue
-                                if not self._is_interpretation_page(title):
-                                    all_items.append(ScrapedItem(
-                                        title=title, url=url,
-                                        source_name=self.name,
-                                        government_level=self.level,
-                                        department=self.config.get("department", ""),
-                                        city=self.city,
-                                        publish_time=pub_time,
-                                    ))
-                        if all_items:
-                            break
-                logger.info("Tavily Search 成功: %s 条", len(all_items))
+                        break
+
+                logger.info("Tavily Search 严格门禁后得到 %s 条候选", len(all_items))
             except Exception as e:
                 logger.warning("Tavily Search 失败: %s", e)
-                errors.append(f"Tavily Search 异常: {e}")
+                remember_error(f"Tavily Search 异常: {e}", "tavily_error")
 
         # 去重
         seen = set()
@@ -512,7 +652,24 @@ class MohrssScraper(BaseScraper):
         elif online_succeeded:
             self._mark_empty()
         else:
-            self._mark_failed("；".join(errors) or "所有在线采集通道均失败", self.last_fetch_error_type)
+            priority = (
+                "waf_challenge",
+                "server_error",
+                "transport_error",
+                "schema_changed",
+                "parse_failed",
+                "http_error",
+                "tavily_error",
+                "tavily_empty",
+            )
+            final_error_type = next(
+                (kind for kind in priority if kind in error_types),
+                error_types[0] if error_types else "all_channels_failed",
+            )
+            self._mark_failed(
+                "；".join(errors) or "所有在线采集通道均失败",
+                final_error_type,
+            )
 
         logger.info("MOHRSS 采集完成: %s 条 (去重后)", len(unique_items))
         return unique_items
@@ -546,9 +703,10 @@ class MohrssScraper(BaseScraper):
                 logger.debug("跳过解读页面: %s", title)
                 continue
             pub_time = self._extract_date_from_text(title, url)
-            if self.days_back and pub_time:
-                if (datetime.now() - pub_time).days > self.days_back:
-                    continue
+            if self.days_back and (
+                not pub_time or (datetime.now() - pub_time).days > self.days_back
+            ):
+                continue
             items.append(ScrapedItem(
                 title=title or "未知标题",
                 url=url,

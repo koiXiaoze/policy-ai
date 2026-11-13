@@ -71,9 +71,18 @@ class SourceCanaryService:
                             error = "首条正文提取为空"
                             error_type = "content_empty"
                     else:
-                        content_status = "no_items"
-                        error = "未取得政策条目，无法验证正文"
-                        error_type = "no_items"
+                        if fetch_status == "empty":
+                            content_status = "empty"
+                            error = "来源结构有效，但时间窗口内没有可验证的政策条目"
+                            error_type = "empty_window"
+                        elif fetch_status == "failed":
+                            content_status = "failed"
+                            error = error or "来源采集失败，未取得可验证的政策条目"
+                            error_type = error_type or "fetch_failed"
+                        else:
+                            content_status = "failed"
+                            error = error or "来源未声明可信的在线采集状态"
+                            error_type = error_type or "unverified_fetch_status"
             except Exception as exc:
                 error = redact_sensitive_text(exc) or exc.__class__.__name__
                 logger.error(

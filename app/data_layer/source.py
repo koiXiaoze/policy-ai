@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+from urllib.parse import urlparse
 
 
 class SourceType(str, Enum):
@@ -328,29 +329,40 @@ class WebSearchSource(PolicySource):
     def get_latest(self, limit: int = 10) -> List[PolicyItem]:
         return self.search(keyword="最新政策", limit=limit)
     
+    @staticmethod
+    def _hostname_matches(hostname: str, domain: str) -> bool:
+        """严格匹配域名本身或其子域，拒绝字符串包含式误判。"""
+        hostname = (hostname or "").lower().rstrip(".")
+        domain = domain.lower().rstrip(".")
+        return hostname == domain or hostname.endswith("." + domain)
+
     def _extract_source(self, url: str) -> str:
-        # 必须从最具体的域名开始判断，"gov.cn" 是 hubei.gov.cn 等域名的子串
-        if "hubei.gov.cn" in url:
+        hostname = (urlparse(url).hostname or "").lower()
+        if self._hostname_matches(hostname, "hubei.gov.cn"):
             return "湖北省人民政府"
-        elif "shiyan.gov.cn" in url:
+        if self._hostname_matches(hostname, "shiyan.gov.cn"):
             return "十堰市人民政府"
-        elif "wuhan.gov.cn" in url:
+        if self._hostname_matches(hostname, "wuhan.gov.cn"):
             return "武汉市人民政府"
-        elif "mohrss.gov.cn" in url:
+        if self._hostname_matches(hostname, "mohrss.gov.cn"):
             return "人力资源和社会保障部"
-        elif "://" in url and url.split("/")[2].endswith(".gov.cn") and not url.split("/")[2].endswith("www.gov.cn"):
+        if self._hostname_matches(hostname, "www.gov.cn"):
+            return "国务院"
+        if self._hostname_matches(hostname, "gov.cn"):
             # 其他 *.gov.cn 子站（部委/直属机构），不能直接标为国务院
             return "国务院部委网站"
-        if "gov.cn" in url:
-            return "国务院"
         return "Web搜索"
-    
+
     def _infer_level(self, url: str) -> str:
-        if "hubei.gov.cn" in url:
+        hostname = (urlparse(url).hostname or "").lower()
+        if self._hostname_matches(hostname, "hubei.gov.cn"):
             return "省"
-        elif "shiyan.gov.cn" in url or "wuhan.gov.cn" in url:
+        if (
+            self._hostname_matches(hostname, "shiyan.gov.cn")
+            or self._hostname_matches(hostname, "wuhan.gov.cn")
+        ):
             return "市"
-        elif "gov.cn" in url:
+        if self._hostname_matches(hostname, "gov.cn"):
             return "国家"
         return "未知"
     

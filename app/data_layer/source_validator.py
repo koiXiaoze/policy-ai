@@ -44,7 +44,10 @@ def passes_authority_domain_gate(url: str, authority: Optional[str]) -> bool:
         return True
     if not url:
         return False
-    host = urlparse(url).netloc.lower()
+    try:
+        host = (urlparse(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
     return host in AUTHORITY_DOMAIN_GATE[authority]
 
 
