@@ -1,6 +1,6 @@
 """
 人力资源和社会保障部政策文件采集器
-支持在线抓取 / MOHRSS 官方搜索接口(分页) / Scrapling 绕过 WAF / Tavily API 回退
+支持在线抓取 / MOHRSS 官方搜索接口(分页) / Scrapling / 百度搜索回退
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import os
 import re
 import time
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -17,11 +17,11 @@ import requests
 from bs4 import BeautifulSoup
 
 from app.scrapers.base import BaseScraper, ScrapedItem
+from app.scrapers.baidu_search import discover_policies_with_baidu
 from app.scrapers.tavily_client import create_tavily_client
 from app.logger import logger
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-TAVILY_API_BASE = "https://api.tavily.com"
 MOHRSS_MIN_CONTENT_LENGTH = 100
 MOHRSS_MAX_CONTENT_LENGTH = 12000
 MOHRSS_ALLOWED_HOSTS = frozenset({"www.mohrss.gov.cn"})
@@ -181,12 +181,6 @@ class MohrssScraper(BaseScraper):
     def _tavily_extract(self, url: str, depth: str = "advanced"):
         return self._tavily_api_call("/extract", {"urls": [url], "extract_depth": depth})
 
-    def _tavily_search(self, query: str, max_results: int = 20):
-        return self._tavily_api_call("/search", {
-            "query": query, "max_results": max_results,
-            "search_depth": "advanced", "include_raw_content": True
-        })
-
     @staticmethod
     def _is_waf_challenge_text(text: str) -> bool:
         """识别返回 HTTP 200 但实际为 WAF/人机挑战的空壳页面。"""
@@ -223,7 +217,7 @@ class MohrssScraper(BaseScraper):
         return False
 
     def _is_policy_discovery_title(self, title: str) -> bool:
-        """Tavily 发现结果必须同时像政策标题且不是常见非政策内容。"""
+        """搜索发现结果必须同时像政策标题且不是常见非政策内容。"""
         normalized = (title or "").strip()
         if not normalized:
             return False
@@ -545,99 +539,22 @@ class MohrssScraper(BaseScraper):
             logger.warning("在线抓取列表页异常: %s", e)
             remember_error(f"列表页异常: {e}", "transport_error")
 
-        # ========== Level 3: Tavily Extract API (列表页) ==========
-        if not all_items and TAVILY_API_KEY:
-            try:
-                logger.info("使用 Tavily Extract API 获取列表页内容")
-                extract_data = self._tavily_extract(self.list_url, "advanced")
-                if not extract_data or not extract_data.get("results"):
-                    remember_error(
-                        "Tavily Extract 未返回可用列表内容",
-                        self.last_fetch_error_type or "tavily_empty",
-                    )
-                else:
-                    extract_found_structure = False
-                    for result in extract_data["results"]:
-                        content = result.get("raw_content", result.get("content", ""))
-                        if not content:
-                            continue
-                        soup = BeautifulSoup(content, "lxml")
-                        if self._list_page_has_structure(soup):
-                            extract_found_structure = True
-                            items = self._parse_list_page(soup, self.list_url)
-                            all_items.extend(items)
-                    if extract_found_structure:
-                        online_succeeded = True
-                        logger.info("Tavily Extract 列表结构有效，解析到 %s 条", len(all_items))
-                        if all_items:
-                            self._mark_live_success()
-                            return all_items
-                    else:
-                        remember_error(
-                            "Tavily Extract 内容缺少可信政策列表结构",
-                            "schema_changed",
-                        )
-            except Exception as e:
-                logger.warning("Tavily Extract 失败: %s", e)
-                remember_error(f"Tavily Extract 异常: {e}", "tavily_error")
-
-        # ========== Level 4: Tavily Search API ==========
-        if not all_items and TAVILY_API_KEY:
-            try:
-                logger.info("使用 Tavily Search API 搜索 MOHRSS 政策")
-                queries = [
-                    'site:mohrss.gov.cn/xxgk2020/zcwjk filetype:html',
-                    'site:mohrss.gov.cn "规范性文件"',
-                    'site:mohrss.gov.cn "政策文件"',
-                    'site:www.mohrss.gov.cn/xxgk2020/fdzdgknr/zcfg/gfxwj 规范性文件',
-                ]
-                for query in queries:
-                    data = self._tavily_search(query, 20)
-                    if not data:
-                        remember_error(
-                            "Tavily Search 未返回数据",
-                            self.last_fetch_error_type or "tavily_empty",
-                        )
-                        continue
-                    if not data.get("results"):
-                        remember_error("Tavily Search 结果为空", "tavily_empty")
-                        continue
-
-                    query_found_candidate = False
-                    for result in data["results"]:
-                        url = result.get("url", "")
-                        title = result.get("title", "")
-                        if not self._is_valid_policy_url(url):
-                            continue
-                        if not self._is_policy_discovery_title(title):
-                            continue
-                        pub_time = self._extract_date_from_text(
-                            title + " " + result.get("content", ""), url
-                        )
-                        # 配置了时间窗口时必须取得可验证日期，不能用无日期结果凑数。
-                        if self.days_back and (
-                            not pub_time or (datetime.now() - pub_time).days > self.days_back
-                        ):
-                            continue
-                        query_found_candidate = True
-                        all_items.append(ScrapedItem(
-                            title=title,
-                            url=url,
-                            source_name=self.name,
-                            government_level=self.level,
-                            department=self.config.get("department", ""),
-                            city=self.city,
-                            publish_time=pub_time,
-                        ))
-
-                    if query_found_candidate:
-                        online_succeeded = True
-                        break
-
-                logger.info("Tavily Search 严格门禁后得到 %s 条候选", len(all_items))
-            except Exception as e:
-                logger.warning("Tavily Search 失败: %s", e)
-                remember_error(f"Tavily Search 异常: {e}", "tavily_error")
+        # ========== Level 3: 百度搜索（官方接口和列表页均失败）==========
+        if not all_items:
+            logger.info("使用百度 AI 搜索补充 MOHRSS 政策")
+            discovery = discover_policies_with_baidu(self.config)
+            if discovery.status == "ok":
+                all_items.extend(discovery.items)
+                online_succeeded = True
+                self._mark_live_success()
+                return all_items
+            if discovery.status == "empty":
+                online_succeeded = True
+            else:
+                remember_error(
+                    discovery.error or "百度搜索失败",
+                    discovery.error_type or "baidu_unknown",
+                )
 
         # 去重
         seen = set()
@@ -659,8 +576,15 @@ class MohrssScraper(BaseScraper):
                 "schema_changed",
                 "parse_failed",
                 "http_error",
-                "tavily_error",
-                "tavily_empty",
+                "baidu_auth",
+                "baidu_quota_exhausted",
+                "baidu_rate_limit",
+                "baidu_timeout",
+                "baidu_network",
+                "baidu_server",
+                "baidu_invalid_response",
+                "baidu_client",
+                "baidu_unknown",
             )
             final_error_type = next(
                 (kind for kind in priority if kind in error_types),

@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     wecom_allowed_user_ids: str = ""
     wecom_command_prefix: str = "/政策"
     log_level: str = "INFO"
+    baidu_api_key: str = ""
     tavily_api_key: str = ""
     wechat_webhook_url: str = ""  # 企业微信群机器人 Webhook URL
     # 数据源连续失败告警开关。默认开启；测试环境显式关闭，避免误发真实通知。
@@ -92,7 +93,9 @@ class Settings(BaseSettings):
 # 全局配置实例
 settings = Settings()
 
-# 导出 Tavily API Key 到环境变量
+# 导出搜索 API Key 到环境变量，兼容运行时动态读取和测试 monkeypatch。
+if settings.baidu_api_key:
+    os.environ["BAIDU_API_KEY"] = settings.baidu_api_key
 if settings.tavily_api_key:
     os.environ["TAVILY_API_KEY"] = settings.tavily_api_key
 

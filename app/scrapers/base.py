@@ -67,6 +67,21 @@ class BaseScraper(ABC):
         self.last_fetch_error = str(error) if error else "采集失败"
         self.last_fetch_error_type = error_type
 
+    @staticmethod
+    def _merge_unique_items(*groups: List[ScrapedItem]) -> List[ScrapedItem]:
+        """合并多个发现通道的结果，按 URL 去重并保留先出现的版本。"""
+        merged: List[ScrapedItem] = []
+        seen_urls = set()
+        for group in groups:
+            for item in group:
+                url = (item.url or "").strip()
+                if url and url in seen_urls:
+                    continue
+                if url:
+                    seen_urls.add(url)
+                merged.append(item)
+        return merged
+
     @abstractmethod
     def fetch(self) -> List[ScrapedItem]:
         """采集政策列表，返回 ScrapedItem 列表

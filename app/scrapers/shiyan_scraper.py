@@ -1,5 +1,5 @@
 """十堰市政府政策文件采集器
-支持在线抓取 / Tavily API 回退 / 本地文件回退
+支持在线抓取 / 百度搜索回退 / 本地文件回退
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from app.scrapers.base import BaseScraper, ScrapedItem
+from app.scrapers.baidu_search import discover_policies_with_baidu
 from app.scrapers.content_cleaner import clean_title
 from app.scrapers.tavily_client import create_tavily_client
 from app.logger import logger
@@ -28,7 +29,6 @@ from app.services.source_canary_diagnostics import (
 
 # Tavily API 配置
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-TAVILY_API_BASE = "https://api.tavily.com"
 REQUEST_MAX_ATTEMPTS = 3
 REQUEST_RETRY_BACKOFF_SECONDS = (0.5, 1.5)
 REQUEST_RETRY_STATUSES = {412, 429, 500, 502, 503, 504}
@@ -253,9 +253,6 @@ class ShiyanScraper(BaseScraper):
     def _tavily_extract(self, url: str, depth: str = "advanced") -> Optional[dict]:
         return self._tavily_api_call("/extract", {"urls": [url], "depth": depth})
 
-    def _tavily_search(self, query: str, max_results: int = 5) -> Optional[dict]:
-        return self._tavily_api_call("/search", {"query": query, "max_results": max_results})
-
     def _extract_date_from_text(self, text: str) -> Optional[datetime]:
         m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
         if m:
@@ -298,173 +295,28 @@ class ShiyanScraper(BaseScraper):
                     pass
         return None
 
-    def _tavily_fetch_list(
+    def _baidu_fetch_list(
         self, page_urls: Optional[List[str]] = None
     ) -> Tuple[List[ScrapedItem], List[str]]:
-        """调用 Tavily；可只补抓指定栏目，返回合并结果和失败栏目。"""
-        if not TAVILY_API_KEY:
-            logger.info("未配置 TAVILY_API_KEY，跳过 Tavily 抓取")
-            self._remember_failed_channel("tavily_failed")
-            self._remember_failure_category("not_configured")
-            return [], ["Tavily 未配置"]
+        """百度搜索按站点统一补抓，失败信息映射到尚未成功的栏目。"""
+        discovery = discover_policies_with_baidu(self.config)
+        if discovery.status == "ok":
+            self.last_fetch_error_type = None
+            return discovery.items, []
+        if discovery.status == "empty":
+            self.last_fetch_error_type = None
+            targets = page_urls if page_urls is not None else self._list_page_urls()
+            return [], [
+                f"{page_url}: 百度搜索未发现新增政策"
+                for page_url in targets
+            ]
 
-        logger.info("使用 Tavily extract API (advanced) 从列表页面获取十堰市政策...")
-        all_links = []
-        seen_urls = set()
-        failures: List[str] = []
-        cutoff = datetime.now() - timedelta(days=self.days_back) if self.days_back else None
-
-        for page_url in page_urls if page_urls is not None else self._list_page_urls():
-            page_has_valid_policy = False
-            page_match_count = 0
-            try:
-                logger.info("Tavily extract 页面: %s", page_url)
-                extract_data = self._tavily_extract(page_url, "advanced")
-
-                if not extract_data or not extract_data.get("results"):
-                    logger.warning("Tavily extract 无结果数据: %s", page_url)
-                    failures.append(f"{page_url}: Tavily 未返回页面内容")
-                    continue
-
-                for result in extract_data["results"]:
-                    raw_content = result.get("raw_content", result.get("content", ""))
-                    if not raw_content:
-                        continue
-
-                    raw_content = self._ensure_utf8(raw_content)
-
-                    # 三类输出统一归一化为 (标题, 链接, 日期)，避免把
-                    # HTML 正则的 URL 字段误当成标题。
-                    markdown_pattern = (
-                        r'\*\s+\[([^\]]+)\]\((https?://[^)\s"]+)[^)]*\)'
-                        r'\s*(\d{4}-\d{2}-\d{2})'
-                    )
-                    html_pattern = (
-                        r"<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>"
-                        r"([^<]+)</a>.*?(\d{4}-\d{2}-\d{2})"
-                    )
-                    text_pattern = (
-                        r"([^\n]{10,}?)\s+(https?://[^\s]+)"
-                        r"\s+(\d{4}-\d{2}-\d{2})"
-                    )
-
-                    markdown_matches = re.findall(
-                        markdown_pattern, raw_content, re.DOTALL | re.IGNORECASE
-                    )
-                    html_matches = re.findall(
-                        html_pattern, raw_content, re.DOTALL | re.IGNORECASE
-                    )
-                    text_matches = re.findall(
-                        text_pattern, raw_content, re.DOTALL | re.IGNORECASE
-                    )
-
-                    matches = []
-                    matches.extend(
-                        (title, url, date_str)
-                        for title, url, date_str in markdown_matches
-                    )
-                    matches.extend(
-                        (title, url, date_str)
-                        for url, title, date_str in html_matches
-                    )
-                    matches.extend(
-                        (title, url, date_str)
-                        for title, url, date_str in text_matches
-                    )
-                    page_match_count += len(matches)
-
-                    logger.info(
-                        "正则匹配到 %s 条结果 (页面: %s)", len(matches), page_url
-                    )
-
-                    for title, url, date_str in matches:
-                        if not isinstance(title, str) or not isinstance(url, str):
-                            continue
-                        title = self._clean_policy_title(title)
-                        if not title:
-                            continue
-
-                        full_url = self._clean_and_normalize_url(url, page_url)
-                        if full_url in seen_urls:
-                            continue
-                        if not self._is_valid_policy_url(full_url):
-                            continue
-                        if "解读" in title or "【解读】" in title or "[解读]" in title:
-                            logger.info("解读页面，跳过: %s", title[:30])
-                            continue
-
-                        # 结构校验通过即视为该栏目有效；即使同一政策也出现
-                        # 在其他栏目，去重只能影响合并结果，不能伪造栏目失败。
-                        page_has_valid_policy = True
-                        if full_url in seen_urls:
-                            continue
-
-                        # 只有通过标题、域名和详情页校验后才占用去重键，
-                        # 避免错误候选遮挡后续同一链接的有效标题。
-                        seen_urls.add(full_url)
-
-                        # 日期优先级（实测校准）：
-                        # 1. 列表页明示日期 —— 官网展示的成文/发布日
-                        #    （实测与 URL 归档日期系统性不同：
-                        #     生育支持政策 列表 09-10 / URL 09-18）
-                        # 2. URL 的 /tYYYYMMDD_ —— 归档日期，作为兜底
-                        # 3. 正文日期
-                        pub_time = None
-                        if date_str:
-                            pub_time = self._extract_date_from_text(date_str)
-                        if not pub_time:
-                            pub_time = self._extract_date_from_url(full_url)
-                        if not pub_time:
-                            pub_time = self._extract_date_from_text(raw_content[:5000])
-
-                        if cutoff and pub_time and pub_time < cutoff:
-                            logger.info(
-                                "政策过期跳过: %s (发布日期: %s, 截止: %s)",
-                                title[:30],
-                                pub_time,
-                                cutoff,
-                            )
-                            continue
-                        if cutoff and not pub_time:
-                            logger.info("无法获取日期，跳过: %s", title[:30])
-                            continue
-
-                        all_links.append({
-                            "title": title.strip(),
-                            "url": full_url.strip(),
-                            "pub_time": pub_time,
-                        })
-
-                if not page_has_valid_policy:
-                    if page_match_count:
-                        failures.append(f"{page_url}: 匹配到候选但无有效政策")
-                    else:
-                        failures.append(f"{page_url}: 页面内容未匹配到政策条目")
-
-            except Exception as exc:
-                logger.warning("Tavily extract 页面失败 %s: %s", page_url, exc)
-                failures.append(f"{page_url}: {exc}")
-
-        if failures:
-            self._remember_failed_channel("tavily_failed")
-            self._remember_failure_category("channel_error")
-        if not all_links:
-            logger.warning("Tavily extract 无有效结果")
-
-        all_links.sort(key=lambda item: item["pub_time"] or datetime.min, reverse=True)
-        items = [
-            ScrapedItem(
-                title=link["title"],
-                url=link["url"],
-                source_name=self.name,
-                government_level=self.level,
-                department="十堰市人民政府",
-                publish_time=link["pub_time"],
-            )
-            for link in all_links
-        ]
-        logger.info("Tavily extract 获取到 %s 条十堰市政策", len(items))
-        return items, failures
+        self._remember_failed_channel("baidu_failed")
+        self._remember_failure_category("channel_error")
+        self.last_fetch_error_type = discovery.error_type
+        reason = discovery.error or discovery.error_type or "百度搜索失败"
+        targets = page_urls if page_urls is not None else self._list_page_urls()
+        return [], [f"{page_url}: {reason}" for page_url in targets]
 
     def _infer_title_from_url(self, url: str) -> str:
         return url.split("/")[-1].replace(".shtml", "").replace(".html", "")
@@ -476,21 +328,21 @@ class ShiyanScraper(BaseScraper):
     ) -> Tuple[List[ScrapedItem], List[str], List[str]]:
         """逐栏目补抓失败项，返回合并结果、仍未成功栏目和失败明细。
 
-        先尝试 Tavily；未配置或仍失败的栏目再交给 Scrapling。空 HTML 与
+        先尝试百度；仍失败的栏目再交给 Scrapling。空 HTML 与
         “HTTP 200 但未解析到政策”都不会被视为成功。
         """
         merged = list(items)
         remaining = list(page_urls)
         failures: List[str] = []
 
-        if remaining and TAVILY_API_KEY:
-            tavily_items, tavily_failures = self._tavily_fetch_list(remaining)
-            self._merge_unique_items(merged, tavily_items)
-            failed_urls = set(self._failed_page_urls(tavily_failures))
+        search_config = self.config.get("search_discovery") or {}
+        search_mode = str(search_config.get("mode") or "disabled").lower()
+        if remaining and search_mode in {"preferred", "fallback"}:
+            search_items, search_failures = self._baidu_fetch_list(remaining)
+            self._merge_unique_items(merged, search_items)
+            failed_urls = set(self._failed_page_urls(search_failures))
             remaining = [url for url in remaining if url in failed_urls]
-            failures.extend(tavily_failures)
-        elif remaining:
-            failures.append("Tavily 未配置")
+            failures.extend(search_failures)
 
         if remaining:
             scrapling_items, scrapling_failures = self._fetch_via_scrapling(remaining)
@@ -545,12 +397,12 @@ class ShiyanScraper(BaseScraper):
                 self._mark_live_success()
             return items
 
-        # 2. Tavily API 回退；部分成功时继续补抓失败栏目。
-        logger.warning("直连抓取失败，尝试 Tavily API 回退")
-        items, tavily_failures = self._tavily_fetch_list()
+        # 2. 百度搜索回退；部分成功时继续补抓失败栏目。
+        logger.warning("直连抓取失败，尝试百度搜索回退")
+        items, search_failures = self._baidu_fetch_list()
         if items:
-            logger.info("Tavily API 回退取得 %s 条，检查失败栏目", len(items))
-            failed_urls = self._failed_page_urls(tavily_failures)
+            logger.info("百度搜索回退取得 %s 条，检查失败栏目", len(items))
+            failed_urls = self._failed_page_urls(search_failures)
             if failed_urls:
                 items, unresolved, retry_failures = self._fill_failed_columns(
                     items, failed_urls
@@ -563,17 +415,17 @@ class ShiyanScraper(BaseScraper):
                 else:
                     self._mark_live_success()
                 return items
-            if tavily_failures:
+            if search_failures:
                 self._mark_degraded(
-                    self._failure_reason("Tavily 通道", tavily_failures),
+                    self._failure_reason("百度搜索通道", search_failures),
                     self.last_fetch_error_type,
                 )
             else:
                 self._mark_live_success()
             return items
 
-        # 2.5 Scrapling 直连通道（实测可突破 TLS 指纹封锁）
-        logger.warning("Tavily 不可用，尝试 Scrapling 直连通道")
+        # 2.5 Scrapling 直连通道
+        logger.warning("百度搜索不可用，尝试 Scrapling 直连通道")
         items, scrapling_failures = self._fetch_via_scrapling()
         if items:
             logger.info("Scrapling 通道获取十堰政策: %s 条", len(items))
@@ -590,7 +442,7 @@ class ShiyanScraper(BaseScraper):
         self.last_fetch_error_type = "all_channels_failed"
 
         # 3. 本地文件回退
-        logger.warning("Tavily API 失败，尝试本地文件回退")
+        logger.warning("在线通道失败，尝试本地文件回退")
         items = self._fetch_from_local()
         if items:
             logger.info("本地文件回退成功: %s 条", len(items))

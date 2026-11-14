@@ -29,6 +29,7 @@ def _known_secrets() -> Iterable[str]:
         settings.wecom_corp_secret,
         settings.feishu_app_secret,
         settings.ai_api_key,
+        settings.baidu_api_key,
         settings.tavily_api_key,
         settings.wecom_token,
         settings.wecom_encoding_aes_key,

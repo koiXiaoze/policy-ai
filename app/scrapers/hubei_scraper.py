@@ -1,5 +1,5 @@
 """湖北省政府政策文件采集器
-支持 cloudscraper / Tavily API 回退 / Playwright / 本地文件回退
+支持百度搜索发现 / cloudscraper / Playwright / 本地文件回退
 """
 
 from __future__ import annotations
@@ -9,19 +9,18 @@ import re
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
 from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
 
 from app.scrapers.base import BaseScraper, ScrapedItem
+from app.scrapers.baidu_search import discover_policies_with_baidu
 from app.scrapers.content_cleaner import clean_title
 from app.scrapers.tavily_client import create_tavily_client
 from app.logger import logger
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-TAVILY_API_BASE = "https://api.tavily.com"
 
 
 class HubeiScraper(BaseScraper):
@@ -110,149 +109,48 @@ class HubeiScraper(BaseScraper):
             payload["format"] = fmt
         return self._tavily_api_call("/extract", payload)
 
-    def _tavily_search(self, query, max_results=10):
-        return self._tavily_api_call("/search", {
-            "query": query,
-            "max_results": max_results,
-            "search_depth": "advanced",
-        })
-
-    def _tavily_extract_list(self):
-        """通过 Tavily Extract 直接抓取政策列表页（瑞数 WAF 对爬虫代理放行）。
-        返回的 markdown 每行形如：
-        * [标题](url "标题")[[解读]](...) 2026-09-07
-        """
-        if not TAVILY_API_KEY:
-            return []
-
-        cutoff = None
-        if self.days_back is not None:
-            cutoff = datetime.now().date() - timedelta(days=self.days_back)
-
-        items = []
-        seen = set()
-        for page_url in (self.list_url, self.list_url.replace("list1.shtml", "list1_1.shtml")):
-            try:
-                data = self._tavily_extract(page_url, "advanced", fmt="markdown")
-            except Exception as e:
-                logger.warning("Tavily Extract 列表页异常: %s", e)
-                continue
-            if not data or not data.get("results"):
-                continue
-            markdown = data["results"][0].get("raw_content", "") or ""
-            for line in markdown.splitlines():
-                m = re.search(r"\[([^\[\]]+)\]\((https?://[^)\s\"]+)", line)
-                if not m:
-                    continue
-                title, url = m.group(1), m.group(2)
-                # 跳过栏目导航/分页/空空链接，只保留具体文件页
-                if "list1" in url or url.rstrip("/").endswith(("/zfwj", "/xxgk", "/zwgk")):
-                    continue
-                if not self._is_valid_policy_url(url) or not re.search(r"/t\d{8}_", url):
-                    continue
-                title = title.replace("​", "").strip()
-                if len(title) < 8:
-                    continue
-                url = self._clean_and_normalize_url(url)
-                if url in seen:
-                    continue
-                seen.add(url)
-
-                pub_time = None
-                dm = re.search(r"/t(\d{4})(\d{2})(\d{2})_", url)
-                if dm:
-                    try:
-                        pub_time = datetime(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
-                    except ValueError:
-                        pub_time = None
-                if pub_time is None:
-                    pub_time = self._extract_date_from_text(line, url)
-
-                if cutoff and pub_time and pub_time.date() < cutoff:
-                    continue
-
-                items.append(ScrapedItem(
-                    title=title, url=url,
-                    source_name=self.name,
-                    government_level=self.level,
-                    department=self.config.get("department", "湖北省人民政府"),
-                    publish_time=pub_time,
-                ))
-            if items:
-                break  # 首页已取到数据，不再翻页
-        return items
-
-    def _tavily_fetch_list(self):
-        if not TAVILY_API_KEY:
-            return []
-        
-        logger.info("使用 Tavily Search API 获取湖北省政策列表...")
-        queries = [
-            'site:hubei.gov.cn/zfwj filetype:shtml',
-            'site:hubei.gov.cn/xxgk filetype:shtml',
-            'site:hubei.gov.cn "政策文件"',
-        ]
-        
-        all_items = []
-        seen_urls = set()
-        
-        for query in queries:
-            try:
-                data = self._tavily_search(query, 20)
-                if data and data.get("results"):
-                    for r in data["results"]:
-                        url = r.get("url", "")
-                        title = r.get("title", "")
-                        if not url or not title:
-                            continue
-                        url = self._clean_and_normalize_url(url)
-                        if url in seen_urls:
-                            continue
-                        if not self._is_valid_policy_url(url):
-                            continue
-                        pub_time = self._extract_date_from_text(title + " " + r.get("content", ""), url)
-                        if self.days_back and pub_time:
-                            if (datetime.now() - pub_time).days > self.days_back:
-                                logger.debug("跳过过期政策: %s (发布: %s)", title[:30], pub_time)
-                                continue
-                        seen_urls.add(url)
-                        all_items.append(ScrapedItem(
-                            title=title, url=url,
-                            source_name=self.name,
-                            government_level=self.level,
-                            department=self.config.get("department", "湖北省人民政府"),
-                            publish_time=pub_time,
-                        ))
-            except Exception as e:
-                logger.warning("Tavily 搜索异常: %s", e)
-        
-        logger.info("Tavily Search 获取: %s 条", len(all_items))
-        return all_items
-
     def fetch(self):
         logger.info("开始采集: %s", self.name)
-        
+        self.last_fetch_error = None
+        self.last_fetch_error_type = None
+
+        search_config = self.config.get("search_discovery") or {}
+        search_mode = str(search_config.get("mode") or "disabled").lower()
+        search_items: list[ScrapedItem] = []
+        if search_mode == "preferred":
+            discovery = discover_policies_with_baidu(self.config)
+            if discovery.status == "ok":
+                search_items = discovery.items
+                logger.info("百度政策发现获取 %s 条", len(discovery.items))
+            elif discovery.status == "empty":
+                # 空结果不能证明官网没有新政策：实测既可能确实无更新，
+                # 也可能百度尚未收录政府详情页。必须继续走官网通道。
+                logger.warning("百度政策发现返回空结果，继续官网通道")
+            else:
+                self.last_fetch_error_type = discovery.error_type
+                logger.warning(
+                    "百度政策发现失败，尝试官网通道: %s",
+                    discovery.error or discovery.error_type,
+                )
+
         items = self._fetch_from_list_page()
         if items:
             logger.info("在线列表页获取 %s 条 (日期筛选后)", len(items))
             self._mark_live_success()
-            return items
-        
-        logger.warning("直接访问被 WAF 拦截，尝试 Tavily Extract 抓取列表页")
-        items = self._tavily_extract_list()
-        if items:
-            logger.info("Tavily Extract 列表页获取: %s 条 (日期筛选后)", len(items))
-            self._mark_live_success()
-            return items
+            return self._merge_unique_items(search_items, items)
 
-        logger.warning("Tavily Extract 失败，尝试 Tavily Search API")
-        items = self._tavily_fetch_list()
-        if items:
-            self._mark_live_success()
-            return items
-        
+        if search_mode == "fallback":
+            discovery = discover_policies_with_baidu(self.config)
+            if discovery.status == "ok":
+                self._mark_live_success()
+                return discovery.items
+            if discovery.status == "empty":
+                self._mark_empty()
+                return []
+            self.last_fetch_error_type = discovery.error_type
+
         # 第二通道：Scrapling 直连（实测可突破 412 WAF）
-        logger.warning("Tavily 不可用，尝试 Scrapling 直连通道")
+        logger.warning("百度搜索不可用，尝试 Scrapling 直连通道")
         try:
             from app.scrapers.scrapling_fetcher import ScraplingFetcher
             from bs4 import BeautifulSoup
@@ -263,11 +161,16 @@ class HubeiScraper(BaseScraper):
                 logger.info("Scrapling 通道获取湖北政策: %s 条", len(items))
                 if items:
                     self._mark_live_success()
-                    return items
+                    return self._merge_unique_items(search_items, items)
         except Exception as exc:
             logger.warning("Scrapling 通道失败: %s", exc)
 
-        logger.warning("Tavily 不可用，尝试从本地文件导入")
+        if search_items:
+            logger.info("官网在线通道未取得数据，使用百度发现结果 %s 条", len(search_items))
+            self._mark_live_success()
+            return search_items
+
+        logger.warning("在线通道不可用，尝试从本地文件导入")
         items = self._fetch_from_local_files()
         # 本地静态文件往往只有零星几条，不足以代表"最近政策"。
         # 少于 3 条时继续回退到库内数据，避免只返回 1 条陈旧政策。
@@ -285,7 +188,7 @@ class HubeiScraper(BaseScraper):
         return items
 
     def _fetch_from_database(self):
-        """从本地库回填政策，作为 Tavily 配额耗尽时的降级来源。"""
+        """从本地库回填政策，作为在线通道失败时的降级来源。"""
         try:
             from app.database import SessionLocal
             from app.models.policy import Policy

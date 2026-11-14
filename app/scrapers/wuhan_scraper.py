@@ -1,19 +1,17 @@
 """武汉市人民政府政策采集器
 
-武汉门户主站列表页是 JS 渲染（静态 HTML 无政策链接），Tavily Extract 抓到的是
-新闻栏目。实测可用路径：
+武汉门户主站列表页是 JS 渲染（静态 HTML 无政策链接）。当前路径：
 
-1. 发现：Tavily Search（site:wuhan.gov.cn + 政策关键词）能稳定返回
-   /zwgk/xxgk/zfwj/ 下的真实政策文件页。
-2. 正文：www.wuhan.gov.cn 的政策详情页可直连抓取（HTTP 200，正文完整），
-   因此正文不走 Tavily，减少 API 消耗。
+1. 发现：百度 AI 搜索（site:wuhan.gov.cn + 政策关键词）作为候选补充；
+   实测百度可能未收录武汉政策详情页，因此空或少量结果不能短路官网。
+2. 官网：通过 Scrapling 访问实际包含政策链接的栏目，与百度候选合并去重。
+3. 正文：www.wuhan.gov.cn 政策详情页可直连抓取，正文不使用搜索 API。
 
 不修改现有采集器，为武汉单独实现。
 """
 
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -24,11 +22,7 @@ from bs4 import BeautifulSoup
 
 from app.logger import logger
 from app.scrapers.base import BaseScraper, ScrapedItem
-from app.scrapers.tavily_client import TavilyErrorType, create_tavily_client
-
-
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-TAVILY_API_BASE = "https://api.tavily.com"
+from app.scrapers.baidu_search import discover_policies_with_baidu
 
 # 只接受武汉市政策文件栏目，避免把新闻/图解/公示当成政策
 POLICY_PATH_PATTERNS = [
@@ -45,7 +39,7 @@ POLICY_TITLE_KEYWORDS = [
 
 
 class WuhanScraper(BaseScraper):
-    """武汉市政策采集器：Tavily 发现 + 直连抓正文"""
+    """武汉市政策采集器：百度发现 + 直连抓正文"""
 
     # Scrapling 直连时优先访问实际含政策链接的子栏目。
     # 主入口 /zfwj/ 的列表由脚本二次加载，实测没有可直接解析的政策链接。
@@ -53,22 +47,9 @@ class WuhanScraper(BaseScraper):
         "https://www.wuhan.gov.cn/zwgk/xxgk/zfwj/gfxwj/",
     ]
 
-    SEARCH_QUERIES = [
-        # 按政策文件库的三个子栏目分别检索，命中率与近期覆盖率最高
-        # （实测 5 个查询共发现 69 条政策页，最新到 2026-10-16）
-        "site:wuhan.gov.cn/zwgk/xxgk/zfwj/gfxwj 通知",   # 规范性文件
-        "site:wuhan.gov.cn/zwgk/xxgk/zfwj/bgtwj 通知",   # 办公厅文件
-        "site:wuhan.gov.cn/zwgk/xxgk/zfwj/szfwj 通知",   # 市政府文件
-        "site:wuhan.gov.cn/zwgk/xxgk/zfwj 2026 印发",
-        "site:wuhan.gov.cn/zwgk/xxgk/zfwj 2026 意见 方案",
-    ]
-
     def __init__(self, source_config: dict):
         super().__init__(source_config)
         self.days_back: Optional[int] = source_config.get("days_back")
-        self._tavily_live_success = False
-        self._tavily_error: Optional[str] = None
-        self._tavily_error_type: Optional[str] = None
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -78,30 +59,13 @@ class WuhanScraper(BaseScraper):
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
 
-    # ---------- Tavily ----------
-
-    def _tavily_search(self, query: str, max_results: int = 20) -> Optional[dict]:
-        client = create_tavily_client(TAVILY_API_KEY, timeout=90, max_retries=3, logger=logger)
-        result = client.call_with_details(
-            "/search",
-            {
-                "query": query,
-                "max_results": max_results,
-                "search_depth": "advanced",
-            },
-            timeout=90,
-            max_retries=3,
-        )
-        self._tavily_error_type = result.error_type if not result.ok else None
-        return result.data
-
     # ---------- 发现 ----------
 
     @staticmethod
     def _is_policy_url(url: str) -> bool:
         """只接受政策文件页（.shtml）。
 
-        排除 Tavily 返回的 PDF 附件（如 /202003/P0201910226...pdf）：
+        排除搜索返回的 PDF 附件（如 /202003/P0201910226...pdf）：
         这类文件是历史政策的附件，路径日期与真实发布日期不符，
         且没有可靠发布日期，混入后会污染日报。
         """
@@ -130,77 +94,11 @@ class WuhanScraper(BaseScraper):
 
     @staticmethod
     def _clean_title(title: str) -> str:
-        # Tavily 常返回 "标题 - 武汉市人民政府" / "标题_武汉市人民政府" 形式
+        # 搜索常返回 "标题 - 武汉市人民政府" / "标题_武汉市人民政府" 形式
         return re.split(r"\s*[-_|]\s*武汉市?人民政府.*$", title.strip())[0].strip()
 
-    def _fetch_via_tavily(self) -> List[ScrapedItem]:
-        self._tavily_live_success = False
-        self._tavily_error = None
-        self._tavily_error_type = None
-        if not TAVILY_API_KEY:
-            self._tavily_error = "Tavily API Key 未配置"
-            self._tavily_error_type = TavilyErrorType.AUTH
-            logger.warning("武汉采集: Tavily Key 未配置，无法发现政策列表")
-            return []
-
-        cutoff = None
-        if self.days_back is not None:
-            cutoff = datetime.now().date() - timedelta(days=self.days_back)
-
-        items: List[ScrapedItem] = []
-        seen = set()
-
-        for query in self.SEARCH_QUERIES:
-            data = self._tavily_search(query, 20)
-            if data is None:
-                self._tavily_error = "Tavily 搜索请求失败"
-            else:
-                # 空 results 是正常在线响应，代表近期无匹配政策。
-                self._tavily_live_success = True
-            results = (data or {}).get("results", []) or []
-            for row in results:
-                url = (row.get("url") or "").split("#", 1)[0]
-                title = self._clean_title(row.get("title") or "")
-                if not url or not title or url in seen:
-                    continue
-                if url.startswith("http://"):
-                    url = "https://" + url[len("http://"):]
-                if not self._is_policy_url(url):
-                    continue
-                if not self._is_policy_title(title) or len(title) < 8:
-                    continue
-
-                publish_time = self._extract_publish_time(url)
-                if not publish_time:
-                    # 兜底：从 Tavily 返回内容里抓日期
-                    m = re.search(r"(20\d{2})[-年/](\d{1,2})[-月/](\d{1,2})",
-                                  row.get("content") or "")
-                    if m:
-                        try:
-                            publish_time = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                        except ValueError:
-                            publish_time = None
-
-                if cutoff and publish_time and publish_time.date() < cutoff:
-                    continue
-
-                seen.add(url)
-                items.append(ScrapedItem(
-                    title=title,
-                    url=url,
-                    source_name=self.name,
-                    government_level=self.level,
-                    department=self.config.get("department", "武汉市人民政府"),
-                    city=self.city or "武汉",
-                    publish_time=publish_time,
-                ))
-
-        items.sort(key=lambda i: i.publish_time or datetime.min, reverse=True)
-        logger.info("武汉 Tavily 发现政策: %s 条", len(items))
-        return items
-
     def _parse_list_html(self, html: str, base_url: str) -> List[ScrapedItem]:
-        """解析武汉政策列表页，复用 Tavily 通道的筛选和日期规则。"""
+        """解析武汉政策列表页，复用搜索通道的筛选和日期规则。"""
         if not html:
             return []
 
@@ -240,7 +138,7 @@ class WuhanScraper(BaseScraper):
         return items
 
     def _fetch_via_scrapling(self) -> List[ScrapedItem]:
-        """Tavily 请求失败后，直接从武汉官网抓取政策列表。"""
+        """百度请求失败后，直接从武汉官网抓取政策列表。"""
         try:
             from app.scrapers.scrapling_fetcher import ScraplingFetcher
 
@@ -267,41 +165,65 @@ class WuhanScraper(BaseScraper):
 
     def fetch(self) -> List[ScrapedItem]:
         logger.info("开始采集: %s", self.name)
-        items = self._fetch_via_tavily()
-        if items:
-            self._mark_live_success()
-            return items
+        self.last_fetch_error = None
+        self.last_fetch_error_type = None
+        search_config = self.config.get("search_discovery") or {}
+        search_mode = str(search_config.get("mode") or "disabled").lower()
+        search_items: list[ScrapedItem] = []
+        search_error_type: Optional[str] = None
+        search_reason: Optional[str] = None
 
-        if not TAVILY_API_KEY and self._tavily_error is None:
-            self._tavily_error = "Tavily API Key 未配置"
+        def run_search() -> None:
+            nonlocal search_items, search_error_type, search_reason
+            discovery = discover_policies_with_baidu(self.config)
+            if discovery.status == "ok":
+                search_items = discovery.items
+                logger.info("武汉百度发现政策: %s 条，继续官网补充", len(search_items))
+                return
+            if discovery.status == "empty":
+                # 百度空结果不是官网无更新的可信证据。实时验证发现武汉政策
+                # 详情页可能长期未被百度收录，因此仍须尝试官网和库内数据。
+                search_error_type = "baidu_empty"
+                search_reason = "百度搜索返回空结果"
+                logger.warning("武汉百度搜索返回空结果，继续官网通道")
+                return
+            search_error_type = discovery.error_type
+            search_reason = discovery.error or discovery.error_type or "百度搜索不可用"
 
-        if getattr(self, "_tavily_live_success", False):
-            # Tavily 正常响应但没有匹配政策，属于“无更新”，不能误判为故障。
-            self._mark_empty()
-            return []
+        if search_mode == "preferred":
+            run_search()
 
-        tavily_reason = getattr(self, "_tavily_error", None) or "Tavily 不可用"
-
-        # 第二通道：直接抓取官网；只有 Tavily 请求失败才启用。
-        logger.warning("武汉 Tavily 抓取失败，尝试 Scrapling 直连: %s", tavily_reason)
+        # 搜索与官网结果必须合并，避免百度只收录部分页面时短路官网全量发现。
         items = self._fetch_via_scrapling()
         if items:
             self._mark_live_success()
-            return items
+            return self._merge_unique_items(search_items, items)
+
+        if search_mode == "fallback":
+            run_search()
+        if search_items:
+            self._mark_live_success()
+            return search_items
 
         # 最终降级：所有实时通道失败后，才使用库内旧数据。
-        reason = f"Tavily: {tavily_reason}; Scrapling: 未取得数据"
+        reason = f"百度: {search_reason or '未启用'}; Scrapling: 未取得数据"
         logger.warning("武汉实时通道均失败，回退到库内已有政策: %s", reason)
         items = self._fetch_from_database()
         if items:
-            self._mark_degraded(f"在线通道失败，使用数据库旧数据: {reason}", self._tavily_error_type)
+            self._mark_degraded(
+                f"在线通道失败，使用数据库旧数据: {reason}",
+                search_error_type or "all_channels_failed",
+            )
             return items
 
-        self._mark_failed(f"在线通道失败且数据库无可用旧数据: {reason}", self._tavily_error_type)
+        self._mark_failed(
+            f"在线通道失败且数据库无可用旧数据: {reason}",
+            search_error_type or "all_channels_failed",
+        )
         return []
 
     def _fetch_from_database(self) -> List[ScrapedItem]:
-        """从本地库回填武汉政策，作为 Tavily 不可用时的降级来源。"""
+        """从本地库回填武汉政策，作为搜索不可用时的降级来源。"""
         try:
             from app.database import SessionLocal
             from app.models.policy import Policy

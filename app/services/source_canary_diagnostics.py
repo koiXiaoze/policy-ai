@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from app.scrapers.baidu_search import BaiduSearchErrorType
 from app.scrapers.tavily_client import TavilyErrorType
 
 
 ALLOWED_CHANNEL_FAILURES = frozenset(
     {
         "direct_failed",
+        "baidu_failed",
         "tavily_failed",
         "scrapling_failed",
     }
@@ -31,6 +33,20 @@ ALLOWED_FAILURE_CATEGORIES = frozenset(
         "parse_empty",
         "not_configured",
         "channel_error",
+    }
+)
+
+BAIDU_ERROR_TYPES = frozenset(
+    {
+        BaiduSearchErrorType.AUTH,
+        BaiduSearchErrorType.CLIENT,
+        BaiduSearchErrorType.QUOTA_EXHAUSTED,
+        BaiduSearchErrorType.RATE_LIMIT,
+        BaiduSearchErrorType.SERVER,
+        BaiduSearchErrorType.TIMEOUT,
+        BaiduSearchErrorType.NETWORK,
+        BaiduSearchErrorType.INVALID_RESPONSE,
+        BaiduSearchErrorType.UNKNOWN,
     }
 )
 
@@ -53,7 +69,7 @@ TAVILY_ERROR_TYPES = frozenset(
     }
 )
 
-ALLOWED_ERROR_TYPES = TAVILY_ERROR_TYPES | frozenset(
+ALLOWED_ERROR_TYPES = BAIDU_ERROR_TYPES | TAVILY_ERROR_TYPES | frozenset(
     {
         "all_channels_failed",
         "canary_exception",
@@ -64,6 +80,9 @@ ALLOWED_ERROR_TYPES = TAVILY_ERROR_TYPES | frozenset(
         "fetch_failed",
         "unverified_fetch_status",
         "direct_failed",
+        "baidu_error",
+        "baidu_empty",
+        "baidu_failed",
         "tavily_error",
         "tavily_empty",
         "tavily_failed",
@@ -97,6 +116,7 @@ __all__ = [
     "ALLOWED_CHANNEL_FAILURES",
     "ALLOWED_ERROR_TYPES",
     "ALLOWED_FAILURE_CATEGORIES",
+    "BAIDU_ERROR_TYPES",
     "TAVILY_ERROR_TYPES",
     "filter_diagnostic_values",
 ]

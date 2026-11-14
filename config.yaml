@@ -12,6 +12,9 @@ sources:
   # 采集窗口（入库用）与推送窗口（日报 3/7 天）相互独立：
   # 放宽采集可回填历史数据，供趋势分析使用，不会污染日报主列表。
   days_back: 90
+  # 国务院结构化 JSON 已验证稳定，明确禁止消耗第三方搜索额度。
+  search_discovery:
+    mode: disabled
   health_probe:
     enabled: true
     url: https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json
@@ -36,6 +39,41 @@ sources:
   # （jyt/rst/kjt/jxt 等）混入的招聘、招标、访谈、名单等非政策内容
   policy_path_prefixes:
     - /zfwj/
+  # 湖北列表页经常触发 WAF，百度先做政策发现，但仍执行官网/Scrapling
+  # 并合并结果；百度空结果不能短路官网通道。
+  search_discovery:
+    provider: baidu
+    mode: preferred
+    queries:
+      - "政策文件 通知 意见 办法 方案 规划 决定 公告"
+      - "省政府 规范性文件 通知 意见 办法 方案 规划"
+    lookback_days: 7
+    top_k: 50
+    timeout_seconds: 30
+    max_retries: 2
+    url_patterns:
+      - '/t\d{8}_'
+    title_keywords:
+      - 通知
+      - 意见
+      - 办法
+      - 规定
+      - 决定
+      - 方案
+      - 规划
+      - 条例
+      - 细则
+      - 公告
+      - 批复
+      - 指南
+    blocked_title_keywords:
+      - 解读
+      - 图解
+      - 问答
+      - 招聘
+      - 招考
+      - 公示
+      - 采购
   health_probe:
     enabled: true
     url: https://www.hubei.gov.cn/zfwj/list1.shtml
@@ -47,12 +85,50 @@ sources:
   level: 市
   city: 武汉
   website: https://www.wuhan.gov.cn
-  # 主站列表页为 JS 渲染，专用采集器用 Tavily 发现政策、直连抓取正文
+  # 主站列表页为 JS 渲染；百度补充发现，Scrapling 发现结果与正文均由官网读取
   scraper_type: wuhan
   enabled: true
   scrape_interval_hours: 24
   description: 武汉市政府政策文件
   days_back: 90
+  # 主站列表由 JavaScript 二次加载，百度先做政策发现，但仍执行
+  # Scrapling 并合并结果；百度空结果不能短路官网通道。
+  search_discovery:
+    provider: baidu
+    mode: preferred
+    queries:
+      - "政策文件 通知 意见 办法 方案 规划 印发"
+      - "规范性文件 市政府文件 办公厅文件"
+    lookback_days: 7
+    top_k: 50
+    timeout_seconds: 30
+    max_retries: 2
+    path_prefixes:
+      - /zwgk/xxgk/zfwj/
+      - /gfxwj/
+    url_patterns:
+      - '/t\d{8}_\d+\.s?html?$'
+    title_keywords:
+      - 通知
+      - 意见
+      - 办法
+      - 规定
+      - 决定
+      - 方案
+      - 规划
+      - 条例
+      - 细则
+      - 公告
+      - 政策措施
+      - 行动计划
+    blocked_title_keywords:
+      - 解读
+      - 图解
+      - 问答
+      - 招聘
+      - 招考
+      - 公示
+      - 采购
   health_probe:
     enabled: true
     # 官方规范性文件列表页可访问，但静态 HTML 中没有政策条目，依赖前端二次加载。
@@ -81,6 +157,40 @@ sources:
     - /xxgk/zc_67263/xxgk_zcfg/
     - /xxgk/zc_67263/qt/
     - /xxgk/zc_67263/gfxwj/
+  # 直连失败或部分栏目失败时，用百度补充政策发现。
+  search_discovery:
+    provider: baidu
+    mode: fallback
+    queries:
+      - "政策文件 通知 意见 办法 方案 规划 规范性文件"
+      - "市政府 政策文件 通知 公告"
+    lookback_days: 7
+    top_k: 50
+    timeout_seconds: 30
+    max_retries: 2
+    url_patterns:
+      - '/\d{6}/t\d{8}_'
+    title_keywords:
+      - 通知
+      - 意见
+      - 办法
+      - 规定
+      - 决定
+      - 方案
+      - 规划
+      - 条例
+      - 细则
+      - 公告
+      - 批复
+      - 指南
+    blocked_title_keywords:
+      - 解读
+      - 图解
+      - 问答
+      - 招聘
+      - 招考
+      - 公示
+      - 采购
   health_probe:
     enabled: true
     url: https://www.shiyan.gov.cn/xxgk/zc_67263/qt/
@@ -98,6 +208,53 @@ sources:
   description: 人社部政策文件
   month_only: true
   days_back: 180
+  # 官方站内搜索接口优先；接口和列表页均失败时由百度搜索补充。
+  search_discovery:
+    provider: baidu
+    mode: fallback
+    queries:
+      - "规范性文件 政策文件 通知 意见 办法 方案 规划"
+      - "人社部 政策文件 通知 公告 决定"
+    lookback_days: 7
+    top_k: 50
+    timeout_seconds: 30
+    max_retries: 2
+    url_patterns:
+      - '/\d{6}/t\d{8}_'
+      - '/\d{4}/\d{2}/\d{2}/'
+      - '/t\d{8}_'
+    title_keywords:
+      - 通知
+      - 意见
+      - 办法
+      - 规定
+      - 决定
+      - 方案
+      - 细则
+      - 规划
+      - 条例
+      - 批复
+      - 指南
+      - 标准
+      - 规则
+      - 公告
+    blocked_title_keywords:
+      - 解读
+      - 图解
+      - 问答
+      - 一图读懂
+      - 新闻
+      - 动态
+      - 招聘
+      - 招考
+      - 考试
+      - 直播
+      - 访谈
+      - 视频
+      - 图片
+      - 名单
+      - 公示
+      - 采购
   health_probe:
     enabled: true
     url: https://www.mohrss.gov.cn/xxgk2020/zcwjk/

@@ -9,7 +9,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 env_path = Path(__file__).parent / ".env"
 load_dotenv(env_path)
-# 确保 TAVILY_API_KEY 写入 os.environ
+# 百度搜索与 Tavily 正文兜底都按空值初始化，避免模块导入时读取未定义变量。
+os.environ.setdefault("BAIDU_API_KEY", "")
 os.environ.setdefault("TAVILY_API_KEY", "")
 
 sys.path.insert(0, str(Path(__file__).parent))

@@ -194,7 +194,7 @@ class LocalDBSource(PolicySource):
 
 
 class WebSearchSource(PolicySource):
-    """Web搜索源（Tavily等）"""
+    """百度 AI 搜索源，仅用于政策发现。"""
     
     # 地区 → 官方门户域名（与 AUTHORITY_DOMAIN_GATE 对齐）
     # 避免从部委子站、地方融媒等渠道采集"看起来像"的内容
@@ -211,21 +211,23 @@ class WebSearchSource(PolicySource):
         "十堰": ["www.shiyan.gov.cn"],
     }
     
-    # 未指定地区时的默认域（只保留四个本级门户主站）
+    # 未指定地区时的默认域（国务院走官方 JSON，不进入搜索发现）
     DEFAULT_DOMAINS = [
-        "www.gov.cn", "www.hubei.gov.cn",
-        "www.wuhan.gov.cn", "www.shiyan.gov.cn",
+        "www.hubei.gov.cn", "www.wuhan.gov.cn", "www.shiyan.gov.cn",
     ]
+
+    # 国务院政策 JSON 已稳定可直连，明确禁止消耗第三方搜索额度。
+    SEARCH_EXCLUDED_DOMAINS = frozenset({"www.gov.cn"})
     
     def __init__(self):
-        self.tavily_api_key = None
-        self._init_tavily()
+        self.baidu_api_key = None
+        self._init_baidu()
     
-    def _init_tavily(self):
+    def _init_baidu(self):
         try:
             from app.config import settings
-            if settings.tavily_api_key:
-                self.tavily_api_key = settings.tavily_api_key
+            if settings.baidu_api_key:
+                self.baidu_api_key = settings.baidu_api_key
         except Exception:
             pass
     
@@ -234,8 +236,16 @@ class WebSearchSource(PolicySource):
         if region:
             for key, domains in self.REGION_DOMAIN_MAP.items():
                 if key in region:
-                    return domains
-        return self.DEFAULT_DOMAINS
+                    return [
+                        domain
+                        for domain in domains
+                        if domain not in self.SEARCH_EXCLUDED_DOMAINS
+                    ]
+        return [
+            domain
+            for domain in self.DEFAULT_DOMAINS
+            if domain not in self.SEARCH_EXCLUDED_DOMAINS
+        ]
 
     @property
     def source_type(self) -> SourceType:
@@ -243,18 +253,21 @@ class WebSearchSource(PolicySource):
     
     @property
     def name(self) -> str:
-        return "Tavily Web Search"
+        return "Baidu Web Search"
     
     def is_available(self) -> bool:
-        return self.tavily_api_key is not None
+        return self.baidu_api_key is not None
     
     def search(self, region: str = None, keyword: str = None, date_range: str = None, limit: int = 20) -> List[PolicyItem]:
         if not self.is_available():
             return []
         
         try:
-            from tavily import TavilyClient
-            client = TavilyClient(api_key=self.tavily_api_key)
+            from app.scrapers.baidu_search import (
+                DEFAULT_LOOKBACK_DAYS,
+                create_baidu_client,
+            )
+            client = create_baidu_client(self.baidu_api_key)
             
             # 构建查询
             query_parts = []
@@ -272,58 +285,49 @@ class WebSearchSource(PolicySource):
                 parsed = parse_date_range(date_range)
                 if parsed:
                     days = parsed
-            
+
+            domains = self._domains_for_region(region)
+            if not domains:
+                return []
+
             response = client.search(
-                query=query,
-                max_results=limit,
-                search_depth="advanced",
-                include_domains=self._domains_for_region(region),
-                days=days
+                query,
+                sites=domains,
+                top_k=min(max(1, limit), 50),
+                lookback_days=days or DEFAULT_LOOKBACK_DAYS,
             )
+            if not response.ok:
+                from app.logger import logger
+                logger.warning(
+                    "Baidu search failed: %s",
+                    response.error_type,
+                )
+                return []
             
             results = []
-            for item in response.get("results", []):
+            for item in response.data.get("references", []):
                 results.append(PolicyItem(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     source_name=self._extract_source(item.get("url", "")),
                     government_level=self._infer_level(item.get("url", "")),
-                    publish_time=self._parse_date(item.get("published_date")),
-                    content=item.get("content", "")[:5000],
-                    summary=item.get("content", "")[:500],
+                    publish_time=self._parse_date(item.get("date")),
+                    summary=(
+                        item.get("snippet")
+                        or item.get("content")
+                        or ""
+                    )[:500],
                     source_type=SourceType.WEB_SEARCH,
                     raw_data=item
                 ))
             return results
         except Exception as e:
             from app.logger import logger
-            logger.warning(f"Tavily search failed: {e}")
+            logger.warning(f"Baidu search failed: {e}")
             return []
     
     def fetch_detail(self, url: str) -> Optional[PolicyItem]:
-        if not self.is_available():
-            return None
-        
-        try:
-            from tavily import TavilyClient
-            client = TavilyClient(api_key=self.tavily_api_key)
-            
-            response = client.extract(urls=[url])
-            if response.get("results"):
-                item = response["results"][0]
-                return PolicyItem(
-                    title=item.get("title", ""),
-                    url=url,
-                    source_name=self._extract_source(url),
-                    government_level=self._infer_level(url),
-                    content=item.get("raw_content", item.get("content", "")),
-                    summary=item.get("content", "")[:500],
-                    source_type=SourceType.WEB_SEARCH,
-                    raw_data=item
-                )
-        except Exception as e:
-            from app.logger import logger
-            logger.warning(f"Tavily extract failed: {e}")
+        # 百度只提供搜索摘要，不把摘要伪装成政策全文。
         return None
     
     def get_latest(self, limit: int = 10) -> List[PolicyItem]:
