@@ -63,9 +63,19 @@ def search_policy(region: str = None, keyword: str = None, date_range: str = Non
     return PolicyService.search_policies(region=region, keyword=keyword, date_range=date_range, limit=limit)
 
 
-def get_policy_detail(policy_id: int = None, url: str = None) -> Optional[Dict[str, Any]]:
-    """获取政策详情（统一命名，支持ID或URL）"""
-    return PolicyService.get_policy_detail(policy_id=policy_id, url=url)
+def get_policy_detail(
+    policy_id: int = None,
+    url: str = None,
+    source_name: str = None,
+    title: str = None,
+) -> Optional[Dict[str, Any]]:
+    """获取政策详情（统一命名，支持 ID 或 URL）。"""
+    return PolicyService.get_policy_detail(
+        policy_id=policy_id,
+        url=url,
+        source_name=source_name,
+        title=title,
+    )
 
 
 def search_historical_policies(keyword: str, region: str = None, time_range: str = None, limit: int = 50) -> List[Dict[str, Any]]:
@@ -199,7 +209,9 @@ tool_registry.register(Tool(
         "type": "object",
         "properties": {
             "policy_id": {"type": "integer", "description": "政策ID（本地数据库）"},
-            "url": {"type": "string", "description": "政策URL（跨数据源查询）"}
+            "url": {"type": "string", "description": "政策URL（跨数据源查询）"},
+            "source_name": {"type": "string", "description": "检索结果中的来源名称"},
+            "title": {"type": "string", "description": "检索结果中的权威标题"}
         },
         "required": []
     },

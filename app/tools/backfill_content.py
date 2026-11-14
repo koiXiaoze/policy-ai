@@ -23,8 +23,8 @@ from app.config import get_enabled_sources
 from app.database import SessionLocal, init_db
 from app.logger import logger
 from app.models.policy import Policy
-from app.scrapers.content_cleaner import MIN_CONTENT_LENGTH, strip_site_noise
-from app.scrapers.factory import create_scraper
+from app.scrapers.content_cleaner import MIN_CONTENT_LENGTH
+from app.scrapers.content_fetch import fetch_policy_content, get_url_lock, is_content_ready
 
 
 def find_missing_policies(source: Optional[str] = None, limit: Optional[int] = None) -> List[Policy]:
@@ -80,49 +80,76 @@ def backfill(dry_run: bool = False, limit: Optional[int] = None,
             logger.warning("跳过 policy_id=%s：无匹配采集器 %s", policy.id, policy.source_name)
             continue
 
+        lock = get_url_lock(policy.url or "")
+        if not lock.acquire(blocking=False):
+            stats["skipped"] += 1
+            stats["details"].append({
+                "policy_id": policy.id,
+                "source": policy.source_name,
+                "status": "fetching",
+                "reason": "正文正在由其他任务读取",
+            })
+            continue
+
         try:
-            body = create_scraper(cfg).extract_content(policy.url)
-        except Exception as exc:
-            stats["failed"] += 1
-            stats["details"].append({
-                "policy_id": policy.id, "source": policy.source_name,
-                "status": "failed", "reason": str(exc)[:200],
-            })
-            logger.error("正文抓取异常 policy_id=%s: %s", policy.id, exc)
-            continue
-
-        cleaned = strip_site_noise(body)
-        if not cleaned:
-            stats["failed"] += 1
-            stats["details"].append({
-                "policy_id": policy.id, "source": policy.source_name,
-                "status": "failed", "reason": "抓取内容为空或过短",
-            })
-            logger.warning("正文不可用 policy_id=%s url=%s", policy.id, policy.url[:80])
-            continue
-
-        stats["filled"] += 1
-        stats["details"].append({
-            "policy_id": policy.id, "source": policy.source_name,
-            "status": "filled", "chars": len(cleaned),
-        })
-        logger.info("正文回填成功 policy_id=%s (%s 字) %s",
-                    policy.id, len(cleaned), (policy.title or "")[:30])
-
-        if not dry_run:
             db = SessionLocal()
             try:
-                row = db.query(Policy).filter(Policy.id == policy.id).first()
-                if row:
-                    row.content = cleaned[:10000]
+                current = db.query(Policy).filter(Policy.id == policy.id).first()
+                if not current or is_content_ready(current.content):
+                    stats["skipped"] += 1
+                    stats["details"].append({
+                        "policy_id": policy.id,
+                        "source": policy.source_name,
+                        "status": "skipped",
+                        "reason": "记录已删除或正文已被其他任务补齐",
+                    })
+                    continue
+
+                fetched = fetch_policy_content(current.url, current.source_name)
+                if not fetched.ready:
+                    stats["failed"] += 1
+                    stats["details"].append({
+                        "policy_id": current.id,
+                        "source": current.source_name,
+                        "status": fetched.status,
+                        "reason": fetched.error,
+                        "error_code": fetched.error_code,
+                        "retryable": fetched.retryable,
+                    })
+                    logger.warning(
+                        "正文回填失败 policy_id=%s status=%s: %s",
+                        current.id, fetched.status, fetched.error,
+                    )
+                    continue
+
+                stats["filled"] += 1
+                stats["details"].append({
+                    "policy_id": current.id,
+                    "source": current.source_name,
+                    "status": "filled",
+                    "chars": len(fetched.content or ""),
+                })
+                logger.info(
+                    "正文回填成功 policy_id=%s (%s 字) %s",
+                    current.id, len(fetched.content or ""), (current.title or "")[:30],
+                )
+                if not dry_run:
+                    current.content = fetched.content
                     db.commit()
             except Exception as exc:
                 db.rollback()
                 stats["failed"] += 1
-                stats["filled"] -= 1
-                logger.error("正文写入失败 policy_id=%s: %s", policy.id, exc)
+                stats["details"].append({
+                    "policy_id": policy.id,
+                    "source": policy.source_name,
+                    "status": "failed",
+                    "reason": str(exc)[:200],
+                })
+                logger.error("正文回填异常 policy_id=%s: %s", policy.id, exc)
             finally:
                 db.close()
+        finally:
+            lock.release()
 
     return stats
 

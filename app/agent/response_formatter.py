@@ -7,6 +7,60 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
+import re
+from urllib.parse import urlsplit, urlunsplit
+
+from app.analyzers.ai_analyzer import is_trusted_analysis
+
+
+def _normalize_identity_value(value: Any, kind: str) -> Optional[str]:
+    """归一化失败项身份字段，供记录与展示层共用同一匹配规则。"""
+    if value in (None, ""):
+        return None
+    if kind == "title":
+        text = re.sub(r"\s+", "", str(value)).strip().lower()
+        return text or None
+    if kind == "url":
+        text = str(value).strip()
+        try:
+            parts = urlsplit(text)
+            scheme = parts.scheme.lower()
+            host = parts.netloc.lower()
+            path = parts.path.rstrip("/") or "/"
+            return urlunsplit((scheme, host, path, parts.query, ""))
+        except ValueError:
+            return text.rstrip("/")
+    return str(value).strip() or None
+
+
+def analysis_failures_match(first: Dict[str, Any], second: Dict[str, Any]) -> bool:
+    """判断两个失败项是否描述同一政策，不用标题模糊猜测。"""
+    first_id = _normalize_identity_value(first.get("policy_id"), "id")
+    second_id = _normalize_identity_value(second.get("policy_id"), "id")
+    if first_id and second_id:
+        return first_id == second_id
+    first_url = _normalize_identity_value(first.get("url"), "url")
+    second_url = _normalize_identity_value(second.get("url"), "url")
+    if first_url and second_url:
+        return first_url == second_url
+    first_title = _normalize_identity_value(first.get("title"), "title")
+    second_title = _normalize_identity_value(second.get("title"), "title")
+    if first_title and second_title:
+        return first_title == second_title
+    # 只有无可归属信息时才按同一错误键去重，避免展示逐次重试噪声。
+    if not any((first_id, first_url, first_title, second_id, second_url, second_title)):
+        return (
+            (first.get("error_code") or first.get("error"))
+            == (second.get("error_code") or second.get("error"))
+        )
+    return False
+
+
+def merge_analysis_failure(existing: Dict[str, Any], incoming: Dict[str, Any]) -> None:
+    """保留首条已确认字段，仅补齐缺失值。"""
+    for key, value in incoming.items():
+        if existing.get(key) in (None, "", []) and value not in (None, "", []):
+            existing[key] = value
 
 
 class ResponseMode(str, Enum):
@@ -56,12 +110,20 @@ class ResponseFormatter:
         analysis_results = agent_result.get("analysis_results", [])
         policy_details = agent_result.get("policy_details", [])
         historical_data = agent_result.get("historical_data", [])
+        analysis_failures = agent_result.get("analysis_failures") or []
+        degraded_analyses = agent_result.get("degraded_analyses") or []
         
         # 根据模式格式化
         if mode == ResponseMode.SEARCH:
             return self._format_search(search_results, user_query, agent_result)
         elif mode == ResponseMode.ANALYSIS:
-            return self._format_analysis(analysis_results, policy_details, user_query)
+            return self._format_analysis(
+                analysis_results,
+                policy_details,
+                user_query,
+                analysis_failures=analysis_failures,
+                degraded_analyses=degraded_analyses,
+            )
         elif mode == ResponseMode.TREND:
             return self._format_trend(historical_data, analysis_results, search_results, user_query)
         elif mode == ResponseMode.REPORT:
@@ -230,32 +292,153 @@ class ResponseFormatter:
             suggestions=suggestions
         )
     
-    def _format_analysis(self, analysis_results: List[Dict], policy_details: List[Dict], query: str) -> FormattedResponse:
-        """格式化深度分析"""
-        if not analysis_results and not policy_details:
+    @classmethod
+    def _dedupe_analysis_failures(
+        cls, failures: Optional[List[Dict]]
+    ) -> List[Dict[str, Any]]:
+        """去重失败项，同时用后出现的元数据补齐首条记录。"""
+        deduped: List[Dict[str, Any]] = []
+        for raw in failures or []:
+            if isinstance(raw, dict):
+                failure = dict(raw)
+            elif raw is None:
+                failure = {"error": "本次分析未完成"}
+            else:
+                failure = {"error": str(raw)}
+
+            existing = next(
+                (item for item in deduped if analysis_failures_match(item, failure)),
+                None,
+            )
+            if existing is not None:
+                merge_analysis_failure(existing, failure)
+                continue
+            deduped.append(failure)
+        return deduped
+
+    @staticmethod
+    def _analysis_failure_message(failure: Dict[str, Any]) -> str:
+        """把内部业务状态转换为不臆测原因的 user-facing 文案。"""
+        error_code = failure.get("error_code")
+        content_status = failure.get("content_status")
+        has_policy = bool(failure.get("title") or failure.get("url"))
+
+        if error_code == "CONTENT_NOT_READY":
+            if content_status == "fetching":
+                return "政策已定位，正文正在读取，请稍后重试。"
+            if has_policy:
+                return "政策已定位，正文尚未就绪，请稍后重试。"
+            return "正文尚未就绪，请稍后重试。"
+        if error_code == "CONTENT_FETCH_FAILED":
+            return "官网正文本次读取失败，请稍后重试。"
+        if error_code == "CONTENT_QUALITY_REJECTED":
+            return "页面已读取，但有效正文不足，暂无法分析。"
+        return "本次分析未完成，请稍后重试。"
+
+    @staticmethod
+    def _append_failure_metadata(lines: List[str], failure: Dict[str, Any]) -> None:
+        fields = [
+            ("发布单位", "source_name"),
+            ("发布部门", "department"),
+            ("发布时间", "publish_time"),
+            ("原文链接", "url"),
+        ]
+        for label, key in fields:
+            value = failure.get(key)
+            if not value:
+                continue
+            if key == "url":
+                lines.append(f"**{label}**: [{value}]({value})")
+            elif key == "publish_time":
+                lines.append(f"**{label}**: {str(value)[:10]}")
+            else:
+                lines.append(f"**{label}**: {value}")
+
+    def _format_analysis(
+        self,
+        analysis_results: List[Dict],
+        policy_details: List[Dict],
+        query: str,
+        analysis_failures: Optional[List[Dict]] = None,
+        degraded_analyses: Optional[List[Dict]] = None,
+    ) -> FormattedResponse:
+        """格式化深度分析；无可信全文分析时不输出分析空壳。"""
+        failures = self._dedupe_analysis_failures(analysis_failures)
+        trusted_results = [
+            item for item in analysis_results or [] if is_trusted_analysis(item)
+        ]
+
+        # 有失败、但没有可信分析时，按政策展示已确认状态。
+        if not trusted_results and failures:
+            lines = ["## 暂时无法完成政策分析", ""]
+            for index, failure in enumerate(failures, 1):
+                title = failure.get("title") or "未命名政策"
+                message = self._analysis_failure_message(failure)
+                if len(failures) > 1:
+                    lines.append(f"### {index}. {title}")
+                else:
+                    lines.append(f"### {title}")
+                lines.append(f"**当前状态**: {message}")
+                self._append_failure_metadata(lines, failure)
+                lines.append("")
+
             return FormattedResponse(
                 mode=ResponseMode.ANALYSIS,
-                summary="未获取到可分析的政策正文",
-                main_content=(
-                    "## 无法完成政策分析\n\n"
-                    "**缺失内容**：没有检索到可分析的政策记录。\n\n"
-                    "**可能原因**：\n"
-                    "- 该主题/地区在限定时间窗口内没有匹配政策\n"
-                    "- 政策记录存在但正文未抓取成功（仅有标题和链接）\n"
-                    "- 检索关键词与政策标题表述差异过大\n\n"
-                    "可以换一个更宽的时间范围或更通用的关键词再试。"
-                ),
-                metadata={"query": query, "missing": ["policy_text"]}
+                summary="暂时无法完成政策分析",
+                main_content="\n".join(lines).rstrip(),
+                metadata={
+                    "query": query,
+                    "failure_count": len(failures),
+                    "failures": failures,
+                },
             )
-        
-        # 取第一个分析结果
-        analysis = analysis_results[0] if analysis_results else {}
+
+        # 政策已定位但没有结构化失败：说明分析尚未完成，不猜测具体原因。
+        if not trusted_results and policy_details:
+            lines = ["## 暂时无法完成政策分析", ""]
+            for index, policy in enumerate(policy_details, 1):
+                title = policy.get("title") or "未命名政策"
+                if len(policy_details) > 1:
+                    lines.append(f"### {index}. {title}")
+                else:
+                    lines.append(f"### {title}")
+                lines.append(
+                    "**当前状态**: 政策已定位，但本次未取得可信的全文分析结果，"
+                    "请稍后重试。"
+                )
+                self._append_failure_metadata(lines, policy)
+                lines.append("")
+            return FormattedResponse(
+                mode=ResponseMode.ANALYSIS,
+                summary="暂时无法完成政策分析",
+                main_content="\n".join(lines).rstrip(),
+                metadata={
+                    "query": query,
+                    "degraded_count": len(degraded_analyses or []),
+                    "missing": ["trusted_full_text_analysis"],
+                },
+            )
+
+        # 无分析、无详情：只陈述缺失，不猜测抓取失败或登录要求。
+        if not trusted_results:
+            return FormattedResponse(
+                mode=ResponseMode.ANALYSIS,
+                summary="暂无可分析的政策内容",
+                main_content=(
+                    "## 暂无可分析的政策内容\n\n"
+                    "本次未取得可用于分析的政策正文。"
+                    "你可以补充政策名称或原文链接，或换个关键词后重试。"
+                ),
+                metadata={"query": query, "missing": ["policy_text"]},
+            )
+
+        # 取第一个可信全文分析结果。
+        analysis = trusted_results[0]
         policy = dict(policy_details[0]) if policy_details else {}
 
-        # 分析链路里 _bind_analysis_to_source_policy 已把权威 policy_id/url/title
-        # 写回分析结果。policy_details 在纯问答场景下通常为空，若不回填，
-        # 标题会退化成"未知政策"，读者无法确认分析的是哪份文件。
-        for key in ("title", "url", "source_name", "publish_time"):
+        # 分析链路已把权威 policy_id/url/title 写回分析结果；
+        # 详情列表为空时用这些字段保证读者能确认分析对象。
+        for key in ("title", "url", "source_name", "publish_time", "department"):
             if not policy.get(key) and analysis.get(key):
                 policy[key] = analysis[key]
 
@@ -267,32 +450,27 @@ class ResponseFormatter:
         # 核心信息
         if policy.get("source_name"):
             lines.append(f"**发布单位**: {policy['source_name']}")
+        if policy.get("department"):
+            lines.append(f"**发布部门**: {policy['department']}")
         if policy.get("publish_time"):
             lines.append(f"**发布时间**: {str(policy['publish_time'])[:10]}")
         if policy.get("url"):
             lines.append(f"**原文链接**: [{policy['url']}]({policy['url']})")
         lines.append("")
 
-        # 政策文本缺失时明确说明，而不是用标题链接冒充分析
-        if not analysis and not policy.get("content"):
-            lines.append("> **无法完成深度分析**：未获取到该政策的正文内容，")
-            lines.append("> 因此只能提供标题与链接，不能给出实质性影响判断。")
-            lines.append("> 常见原因：正文抓取失败、页面需登录、或来源仅提供文件下载。")
-            lines.append("")
-        
         # 分析内容
         sections = [
             ("核心内容", analysis.get("一句话总结")),
             ("大白话解释", analysis.get("政策大白话解释")),
             ("国家释放的信号", analysis.get("国家释放的信号")),
         ]
-        
+
         for label, content in sections:
             if content:
                 lines.append(f"### {label}")
                 lines.append(content)
                 lines.append("")
-        
+
         # 影响行业
         industries = analysis.get("影响行业", [])
         if industries:
@@ -300,7 +478,7 @@ class ResponseFormatter:
             for ind in industries:
                 lines.append(f"- **{ind.get('行业', '')}** ({ind.get('影响程度', '')}): {ind.get('原因', '')}")
             lines.append("")
-        
+
         # 未来机会
         opportunities = analysis.get("未来机会", [])
         if opportunities:
@@ -308,7 +486,7 @@ class ResponseFormatter:
             for opp in opportunities:
                 lines.append(f"- {opp}")
             lines.append("")
-        
+
         # 个人建议
         advice = analysis.get("普通大学生建议", [])
         if advice:
@@ -316,20 +494,24 @@ class ResponseFormatter:
             for a in advice:
                 lines.append(f"- {a}")
             lines.append("")
-        
+
         # 趋势评分
         score = analysis.get("趋势评分", 0)
         if score:
             lines.append(f"### 趋势评分: **{score}/100**")
             lines.append("")
-        
+
         return FormattedResponse(
             mode=ResponseMode.ANALYSIS,
             summary=summary,
-            main_content="\n".join(lines),
-            metadata={"query": query, "trend_score": score}
+            main_content="\n".join(lines).rstrip(),
+            metadata={
+                "query": query,
+                "trend_score": score,
+                "failure_count": len(failures),
+            },
         )
-    
+
     def _format_trend(self, historical: List[Dict], analysis_results: List[Dict], 
                       search_results: List[Dict], query: str) -> FormattedResponse:
         """格式化趋势分析"""
@@ -531,9 +713,10 @@ class ResponseFormatter:
         """转换为Markdown字符串"""
         parts = []
         
-        # 标题摘要
-        parts.append(f"## {response.summary}")
-        parts.append("")
+        # 主要内容自带 Markdown 标题时，不再重复输出摘要标题。
+        if response.summary and not response.main_content.lstrip().startswith("#"):
+            parts.append(f"## {response.summary}")
+            parts.append("")
         
         # 主要内容
         if response.main_content:

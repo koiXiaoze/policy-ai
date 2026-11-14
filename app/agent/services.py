@@ -36,6 +36,18 @@ from app.data_layer import (
 )
 from app.data_layer.source_validator import passes_authority_domain_gate
 from app.logger import logger
+from app.scrapers.content_fetch import (
+    CONTENT_FETCH_FAILED,
+    CONTENT_FETCHING,
+    CONTENT_MISSING,
+    CONTENT_NOT_READY,
+    CONTENT_READY,
+    content_error_payload,
+    fetch_policy_content,
+    get_url_lock,
+    is_content_ready,
+    resolve_source_name,
+)
 
 
 def _launch_content_backfill(created: int) -> None:
@@ -72,8 +84,36 @@ class PolicyService:
     """政策查询/分析 Service"""
 
     @staticmethod
+    def trusted_policy_id(source: Optional[Dict[str, Any]]) -> Optional[int]:
+        """仅返回可安全用于 Policy 表查询的本地主键。
+
+        实时检索结果的 ``id`` 来自爬虫 ``raw_data``，不是 Policy.id；
+        ``policy_id`` 或本地库结果才是可信本地主键。
+        """
+        if not isinstance(source, dict):
+            return None
+        explicit = source.get("policy_id")
+        if explicit not in (None, ""):
+            try:
+                return int(explicit)
+            except (TypeError, ValueError):
+                return None
+        if source.get("source_type") == "local_db":
+            value = source.get("id")
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    @staticmethod
     def _policy_item_to_dict(item: PolicyItem) -> Dict[str, Any]:
-        """将 PolicyItem 转换为字典格式（兼容现有 Agent 接口）"""
+        """将 PolicyItem 转换为字典格式（兼容现有 Agent 接口）。
+
+        显式不设置 ``policy_id``：远程列表项的 ``id`` 可能是爬虫原始 ID，
+        不能当作 Policy 表主键。详情读取应优先使用稳定的 ``url``。
+        """
         return {
             "id": item.raw_data.get("id") if item.raw_data else None,
             "title": item.title,
@@ -250,6 +290,7 @@ class PolicyService:
             rows = filtered
             return [{
                 "id": p.id,
+                "policy_id": p.id,
                 "title": p.title,
                 "url": p.url,
                 "source_name": p.source_name,
@@ -361,85 +402,166 @@ class PolicyService:
         return created
 
     @staticmethod
-    def get_policy_detail(policy_id: Optional[int] = None, url: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """获取政策详情（支持ID或URL，跨数据源）"""
+    def _detail_dict(db, policy: Policy) -> Dict[str, Any]:
+        """把 Policy 记录转换为 Agent 使用的统一详情结构。"""
+        analysis = db.query(Analysis).filter(Analysis.policy_id == policy.id).first()
+        return {
+            "id": policy.id,
+            "policy_id": policy.id,
+            "title": policy.title,
+            "department": policy.department,
+            "government_level": policy.government_level,
+            "city": policy.city,
+            "publish_time": policy.publish_time.isoformat() if policy.publish_time else None,
+            "url": policy.url,
+            "source_name": policy.source_name,
+            "content": policy.content,
+            "summary": policy.summary,
+            "keywords": policy.keywords,
+            "importance_score": policy.importance_score,
+            "analysis": {
+                "summary": analysis.summary,
+                "plain_explanation": analysis.plain_explanation,
+                "national_direction": analysis.national_direction,
+                "industry_impact": analysis.industry_impact,
+                "career_opportunity": analysis.career_opportunity,
+                "personal_advice": analysis.personal_advice,
+                "risk_analysis": analysis.risk_analysis,
+                "trend_score": analysis.trend_score,
+                "raw_response": analysis.raw_response,
+            } if analysis else None,
+        }
+
+    @staticmethod
+    def _ensure_detail_content(detail: Dict[str, Any]) -> Dict[str, Any]:
+        """确保详情正文可用；不可用时返回可重试的结构化业务错误。"""
+        content = detail.get("content")
+        if is_content_ready(content):
+            detail["content_status"] = CONTENT_READY
+            return detail
+
+        url = detail.get("url")
+        policy_id = PolicyService.trusted_policy_id(detail)
+        source_name = detail.get("source_name") or resolve_source_name(url or "")
+        if source_name and not detail.get("source_name"):
+            detail["source_name"] = source_name
+        lock = get_url_lock(url or "")
+        # 后台回填已持有锁时，不在用户请求线程等待网络抓取。
+        if not lock.acquire(blocking=False):
+            return content_error_payload(
+                status=CONTENT_FETCHING,
+                error_code=CONTENT_NOT_READY,
+                error="政策已定位，正文正在读取，请稍后重试",
+                retryable=True,
+                policy_id=policy_id,
+                title=detail.get("title"),
+                url=url,
+                source_name=source_name,
+                publish_time=detail.get("publish_time"),
+                department=detail.get("department"),
+            )
+
+        try:
+            # 拿锁后重新查库，后台可能在等待期间已经完成写回。
+            db = SessionLocal()
+            try:
+                policy = db.query(Policy).filter(Policy.id == policy_id).first()
+                if policy and is_content_ready(policy.content):
+                    refreshed = PolicyService._detail_dict(db, policy)
+                    refreshed["content_status"] = CONTENT_READY
+                    return refreshed
+            finally:
+                db.close()
+
+            fetched = fetch_policy_content(url, source_name)
+            if not fetched.ready:
+                return content_error_payload(
+                    status=fetched.status,
+                    error_code=fetched.error_code or CONTENT_FETCH_FAILED,
+                    error=fetched.error or "官网正文读取失败",
+                    retryable=fetched.retryable,
+                    policy_id=policy_id,
+                    title=detail.get("title"),
+                    url=url,
+                    source_name=source_name,
+                    publish_time=detail.get("publish_time"),
+                    department=detail.get("department"),
+                )
+
+            # 正文已经成功取得时，应先保证本次请求可分析；持久化失败
+            # 不能反过来把可用正文丢弃。仅在存在本地主键时尝试写回。
+            detail["content"] = fetched.content
+            detail["content_status"] = CONTENT_READY
+            if not policy_id:
+                return detail
+
+            db = SessionLocal()
+            try:
+                policy = db.query(Policy).filter(Policy.id == policy_id).first()
+                if not policy:
+                    logger.warning(
+                        "正文已读取但本地政策记录不存在 policy_id=%s url=%s",
+                        policy_id, url,
+                    )
+                    return detail
+                policy.content = fetched.content
+                db.commit()
+                refreshed = PolicyService._detail_dict(db, policy)
+                refreshed["content_status"] = CONTENT_READY
+                return refreshed
+            except Exception as exc:
+                db.rollback()
+                logger.warning("正文已读取但写回失败 policy_id=%s: %s", policy_id, exc)
+                return detail
+            finally:
+                db.close()
+        finally:
+            lock.release()
+
+    @staticmethod
+    def get_policy_detail(
+        policy_id: Optional[int] = None,
+        url: Optional[str] = None,
+        source_name: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """获取政策详情，并显式区分正文就绪与业务失败。"""
         if url:
-            return PolicyService._get_detail_by_url(url)
+            return PolicyService._get_detail_by_url(
+                url, source_name=source_name, title=title
+            )
         if policy_id:
             return PolicyService._get_detail_by_id(policy_id)
         return None
 
     @staticmethod
     def _get_detail_by_id(policy_id: int) -> Optional[Dict[str, Any]]:
-        """通过ID查询本地数据库"""
+        """通过 ID 查询本地数据库，并补齐缺失正文。"""
         db = SessionLocal()
         try:
             policy = db.query(Policy).filter(Policy.id == policy_id).first()
             if not policy:
                 return None
-            analysis = db.query(Analysis).filter(Analysis.policy_id == policy_id).first()
-            return {
-                "id": policy.id,
-                "title": policy.title,
-                "department": policy.department,
-                "government_level": policy.government_level,
-                "city": policy.city,
-                "publish_time": policy.publish_time.isoformat() if policy.publish_time else None,
-                "url": policy.url,
-                "source_name": policy.source_name,
-                "content": policy.content,
-                "summary": policy.summary,
-                "keywords": policy.keywords,
-                "importance_score": policy.importance_score,
-                "analysis": {
-                    "summary": analysis.summary,
-                    "plain_explanation": analysis.plain_explanation,
-                    "national_direction": analysis.national_direction,
-                    "industry_impact": analysis.industry_impact,
-                    "career_opportunity": analysis.career_opportunity,
-                    "personal_advice": analysis.personal_advice,
-                    "risk_analysis": analysis.risk_analysis,
-                    "trend_score": analysis.trend_score,
-                    "raw_response": analysis.raw_response
-                } if analysis else None
-            }
+            return PolicyService._ensure_detail_content(
+                PolicyService._detail_dict(db, policy)
+            )
         finally:
             db.close()
 
     @staticmethod
-    def _get_detail_by_url(url: str) -> Optional[Dict[str, Any]]:
-        """通过URL获取政策详情（优先本地DB，再官方API，再Web搜索）"""
+    def _get_detail_by_url(
+        url: str,
+        source_name: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """通过 URL 获取政策；来源目录不可用时回退到站点采集器。"""
         db = SessionLocal()
         try:
             policy = db.query(Policy).filter(Policy.url == url).first()
             if policy:
-                analysis = db.query(Analysis).filter(Analysis.policy_id == policy.id).first()
-                return {
-                    "id": policy.id,
-                    "title": policy.title,
-                    "department": policy.department,
-                    "government_level": policy.government_level,
-                    "city": policy.city,
-                    "publish_time": policy.publish_time.isoformat() if policy.publish_time else None,
-                    "url": policy.url,
-                    "source_name": policy.source_name,
-                    "content": policy.content,
-                    "summary": policy.summary,
-                    "keywords": policy.keywords,
-                    "importance_score": policy.importance_score,
-                    "analysis": {
-                        "summary": analysis.summary,
-                        "plain_explanation": analysis.plain_explanation,
-                        "national_direction": analysis.national_direction,
-                        "industry_impact": analysis.industry_impact,
-                        "career_opportunity": analysis.career_opportunity,
-                        "personal_advice": analysis.personal_advice,
-                        "risk_analysis": analysis.risk_analysis,
-                        "trend_score": analysis.trend_score,
-                        "raw_response": analysis.raw_response
-                    } if analysis else None,
-                    "source_type": "local_db"
-                }
+                detail = PolicyService._detail_dict(db, policy)
+                detail["source_type"] = "local_db"
+                return PolicyService._ensure_detail_content(detail)
         finally:
             db.close()
 
@@ -447,15 +569,39 @@ class PolicyService:
         if official_source:
             item = official_source.fetch_detail(url)
             if item:
-                return PolicyService._policy_item_to_dict(item)
+                detail = PolicyService._policy_item_to_dict(item)
+                return PolicyService._ensure_detail_content(detail)
 
         web_source = source_registry.get_by_type(SourceType.WEB_SEARCH)
         if web_source:
             item = web_source.fetch_detail(url)
             if item:
-                return PolicyService._policy_item_to_dict(item)
+                detail = PolicyService._policy_item_to_dict(item)
+                return PolicyService._ensure_detail_content(detail)
 
-        return None
+        # Tavily 额度或 Web 搜索不可用不代表官网正文不可读。按 URL 主机名
+        # 找回本地配置的站点采集器，直接抓正文，避免详情链路退化成 None。
+        resolved_source = source_name or resolve_source_name(url)
+        fetched = fetch_policy_content(url, resolved_source)
+        if fetched.ready:
+            return {
+                "id": None,
+                "policy_id": None,
+                "title": title,
+                "url": url,
+                "source_name": resolved_source,
+                "content": fetched.content,
+                "content_status": CONTENT_READY,
+            }
+        return content_error_payload(
+            status=fetched.status,
+            error_code=fetched.error_code or CONTENT_FETCH_FAILED,
+            error=fetched.error or "官网正文读取失败",
+            retryable=fetched.retryable,
+            title=title,
+            url=url,
+            source_name=resolved_source,
+        )
 
     @staticmethod
     def search_historical_policies(keyword: str, region: Optional[str] = None,
@@ -543,7 +689,7 @@ class PolicyService:
         # 补正文属于数据库/网络 I/O，统一放主线程。Worker 只拿纯文本，
         # 因此不会出现多个线程共享 Session 或串写数据库的问题。
         for order, source in enumerate(selected):
-            policy_id = source.get("policy_id") or source.get("id")
+            policy_id = PolicyService.trusted_policy_id(source)
             url = source.get("url")
             title = source.get("title") or ""
             content = source.get("content") or ""
@@ -565,16 +711,31 @@ class PolicyService:
                     detail = None
 
                 if isinstance(detail, dict):
+                    if detail.get("error_code"):
+                        failures.append({
+                            "policy_id": policy_id,
+                            "url": url or detail.get("url"),
+                            "title": source.get("title") or detail.get("title") or title,
+                            "error": detail.get("error") or "政策正文不可用",
+                            "error_code": detail.get("error_code"),
+                            "content_status": detail.get("content_status"),
+                            "retryable": bool(detail.get("retryable")),
+                        })
+                        continue
                     content = detail.get("content") or content
                     title = source.get("title") or detail.get("title") or title
                     url = url or detail.get("url")
+                    policy_id = PolicyService.trusted_policy_id(detail) or policy_id
 
-            if len(str(content).strip()) < 50:
+            if not is_content_ready(content):
                 failures.append({
                     "policy_id": policy_id,
                     "url": url,
                     "title": title,
-                    "error": "政策正文过短或无法补抓，无法分析",
+                    "error": "政策已定位，正文尚未就绪，无法分析",
+                    "error_code": CONTENT_NOT_READY,
+                    "content_status": CONTENT_MISSING,
+                    "retryable": True,
                 })
                 continue
 
@@ -800,10 +961,6 @@ class PolicyService:
         按发布时间倒序限量，避免单次任务耗时超过 AgentTask 超时阈值
         （正文抓取约 4-18 秒/条）。已入库且已有正文的不重复抓取。
         """
-        from app.config import get_enabled_sources
-        from app.scrapers.factory import create_scraper
-
-        sources = get_enabled_sources()
         limit = max(0, settings.collect_content_limit)
         ordered = sorted(
             policies,
@@ -812,20 +969,35 @@ class PolicyService:
         )
         filled = 0
         for policy in ordered[:limit]:
-            if policy.content and len(policy.content.strip()) >= 100:
+            if is_content_ready(policy.content):
                 continue
-            matched = [s for s in sources if s.get("name") == policy.source_name]
-            if not matched:
-                logger.debug("无匹配采集器，跳过正文: %s", policy.title[:30])
+            lock = get_url_lock(policy.url or "")
+            if not lock.acquire(blocking=False):
+                logger.info("正文正在由其他任务读取，跳过: %s", (policy.title or "")[:30])
                 continue
             try:
-                content = create_scraper(matched[0]).extract_content(policy.url)
-            except Exception as exc:
-                logger.warning("正文抓取异常: %s - %s", policy.title[:30], exc)
-                continue
-            if content and len(content.strip()) >= 50:
-                policy.content = content[:10000]
-                filled += 1
+                db = SessionLocal()
+                try:
+                    current = db.query(Policy).filter(Policy.id == policy.id).first()
+                    if not current or is_content_ready(current.content):
+                        continue
+                    fetched = fetch_policy_content(current.url, current.source_name)
+                    if not fetched.ready:
+                        logger.warning(
+                            "正文读取失败 policy_id=%s status=%s: %s",
+                            current.id, fetched.status, fetched.error,
+                        )
+                        continue
+                    current.content = fetched.content
+                    db.commit()
+                    filled += 1
+                except Exception as exc:
+                    db.rollback()
+                    logger.warning("正文回填异常 policy_id=%s: %s", policy.id, exc)
+                finally:
+                    db.close()
+            finally:
+                lock.release()
         return filled
 
 
@@ -853,7 +1025,7 @@ class ReportService:
         原实现只比 title/url 的等值，而 LLM 返回的 title 常被改写、
         url 又根本不在分析结果里，导致匹配全部失败、报告正文为空。
         """
-        policy_id = policy.get("policy_id") or policy.get("id")
+        policy_id = PolicyService.trusted_policy_id(policy)
         url = policy.get("url")
         title_key = cls._normalize_title(policy.get("title"))
 

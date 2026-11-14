@@ -21,11 +21,25 @@ from app.analyzers.ai_analyzer import (
 )
 from app.config import settings
 from app.agent.memory import memory
-from app.agent.response_formatter import format_agent_response
+from app.agent.response_formatter import (
+    analysis_failures_match,
+    format_agent_response,
+    merge_analysis_failure,
+)
+from app.scrapers.content_fetch import (
+    CONTENT_MISSING,
+    CONTENT_NOT_READY,
+    content_error_payload,
+)
 from app.models.agent_record import AgentExecutionRecord
 from app.models.agent_task import AgentTask
 from app.database import SessionLocal
 from datetime import datetime
+
+
+# 构建参数阶段发现正文业务错误时，用这个内部键短路真实工具调用。
+# 该键在写执行记录前移除，不会传给工具，也不会进入审计参数。
+_BUSINESS_RESULT_KEY = "__business_result__"
 
 
 @dataclass
@@ -180,7 +194,11 @@ class PolicyAgent:
                 # 记录工具调用
                 last_call = state.get_last_tool_call()
                 if last_call:
-                    state.update_tool_result(last_call, result)
+                    state.update_tool_result(
+                        last_call,
+                        result,
+                        error=self._business_error_text(result),
+                    )
                 logger.info(
                     f"[{task_id}] Tool 结果: {tool_name} - "
                     f"{last_call.status.value if last_call else 'unknown'}"
@@ -209,7 +227,11 @@ class PolicyAgent:
                             return self._tool_failure_result(state, "search_policies", str(exc))
                         last_call = state.get_last_tool_call()
                         if last_call:
-                            state.update_tool_result(last_call, result)
+                            state.update_tool_result(
+                                last_call,
+                                result,
+                                error=self._business_error_text(result),
+                            )
                         self._process_tool_result(state, tool_name, result)
 
                 # 自然语言问答的窗口放宽：用户问"最近有什么政策"时，
@@ -235,7 +257,11 @@ class PolicyAgent:
                             break
                         last_call = state.get_last_tool_call()
                         if last_call:
-                            state.update_tool_result(last_call, result)
+                            state.update_tool_result(
+                                last_call,
+                                result,
+                                error=self._business_error_text(result),
+                            )
                         self._process_tool_result(state, tool_name, result)
                         if state.search_results:
                             logger.info(
@@ -317,8 +343,9 @@ class PolicyAgent:
         if not tool:
             raise ToolExecutionError(tool_name, f"未知工具: {tool_name}")
         
-        # 记录工具调用
-        arguments = self._build_tool_arguments(tool_name, params, state)
+        # 记录工具调用。内部业务结果标记只用于短路，不进入状态和审计。
+        arguments = dict(self._build_tool_arguments(tool_name, params, state))
+        business_result = arguments.pop(_BUSINESS_RESULT_KEY, None)
         tool_call = state.add_tool_call(tool_name, arguments)
         tool_call.status = ToolCallStatus.EXECUTING
 
@@ -330,6 +357,17 @@ class PolicyAgent:
             tool_name=tool_name,
             tool_args=self._serializable_args(tool_name, arguments)
         )
+
+        if business_result is not None:
+            error = self._business_error_text(business_result) or "工具业务前置条件未满足"
+            self._update_execution_record(
+                record,
+                status="business_error",
+                result_summary=self._summarize_result(business_result),
+                error=error,
+                elapsed_ms=0,
+            )
+            return business_result
         
         # generate_report 需要读取当前 AgentState 才能汇总结果，
         # 无法只靠 plan.parameters 重建，因此在执行时注入 state。
@@ -346,7 +384,14 @@ class PolicyAgent:
             start_time = datetime.now()
             result = tool.function(**call_kwargs)
             elapsed_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-            self._update_execution_record(record, status="success", result_summary=self._summarize_result(result), elapsed_ms=elapsed_ms)
+            business_error = self._business_error_text(result)
+            self._update_execution_record(
+                record,
+                status="business_error" if business_error else "success",
+                result_summary=self._summarize_result(result),
+                error=business_error,
+                elapsed_ms=elapsed_ms,
+            )
             return result
         except Exception as e:
             logger.error(f"工具执行失败 {tool_name}: {e}")
@@ -372,6 +417,13 @@ class PolicyAgent:
             state=state,
             error=state.error,
         )
+
+    @staticmethod
+    def _business_error_text(result: Any) -> Optional[str]:
+        """提取工具返回的结构化业务错误文本。"""
+        if isinstance(result, dict) and result.get("error_code"):
+            return str(result.get("error") or result.get("error_code"))
+        return None
 
     @staticmethod
     def _serializable_args(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -418,10 +470,17 @@ class PolicyAgent:
         elif tool_name == "get_policy_detail":
             if state.search_results:
                 first = state.search_results[0]
-                if first.get("id"):
-                    return {"policy_id": first["id"]}
+                # 远程检索项的 id 可能来自爬虫 raw_data，不能当作 Policy 主键。
+                # URL 是跨数据源稳定键，只在没有 URL 时使用可信本地 ID。
                 if first.get("url"):
-                    return {"url": first["url"]}
+                    return {
+                        "url": first["url"],
+                        "source_name": first.get("source_name"),
+                        "title": first.get("title"),
+                    }
+                policy_id = PolicyService.trusted_policy_id(first)
+                if policy_id:
+                    return {"policy_id": policy_id}
             return {"policy_id": 0}
         elif tool_name == "search_historical_policies":
             return {
@@ -437,16 +496,41 @@ class PolicyAgent:
             if target:
                 if target.get("content") and len(target.get("content", "")) >= 50:
                     return {"policy_text": target.get("content", ""), "title": target.get("title", "")}
-                # target 有正文以外的标识时，按它的 id/url 补抓正文。
+                # target 有正文以外的标识时，按它的 URL/可信本地 ID 补抓正文。
                 # 注意不能再往下走 policy_details 分支：那会把对象换成
                 # 另一条政策，分析结果绑不到游标 target 上。
-                from app.agent.tools import get_policy_detail
-                if target.get("id"):
-                    detail = get_policy_detail(policy_id=target["id"])
-                elif target.get("url"):
-                    detail = get_policy_detail(url=target["url"])
+                target_policy_id = PolicyService.trusted_policy_id(target)
+                if target.get("url"):
+                    detail = PolicyService.get_policy_detail(
+                        url=target["url"],
+                        source_name=target.get("source_name"),
+                        title=target.get("title"),
+                    )
+                elif target_policy_id:
+                    detail = PolicyService.get_policy_detail(policy_id=target_policy_id)
                 else:
                     detail = None
+                if isinstance(detail, dict):
+                    for key in (
+                        "source_name",
+                        "publish_time",
+                        "department",
+                        "government_level",
+                        "city",
+                    ):
+                        if not detail.get(key) and target.get(key):
+                            detail[key] = target[key]
+                if detail and detail.get("error_code"):
+                    detail["policy_id"] = (
+                        detail.get("policy_id") or target_policy_id
+                    )
+                    detail["url"] = detail.get("url") or target.get("url")
+                    detail["title"] = detail.get("title") or target.get("title")
+                    logger.warning(
+                        "政策正文业务错误，跳过分析: %s (%s)",
+                        detail.get("title"), detail.get("error_code"),
+                    )
+                    return {_BUSINESS_RESULT_KEY: detail}
                 if detail and detail.get("content") and len(detail.get("content", "")) >= 50:
                     state.current_analyze_target = detail
                     return {
@@ -454,15 +538,45 @@ class PolicyAgent:
                         "title": detail.get("title", "")
                     }
                 logger.info(f"该政策正文不足，跳过分析: {str(target.get('title', ''))[:30]}")
-                return {"policy_text": "", "title": ""}
+                return {_BUSINESS_RESULT_KEY: content_error_payload(
+                    status=CONTENT_MISSING,
+                    error_code=CONTENT_NOT_READY,
+                    error="政策已定位，但正文尚未就绪，请稍后重试",
+                    retryable=True,
+                    policy_id=PolicyService.trusted_policy_id(target),
+                    title=target.get("title"),
+                    url=target.get("url"),
+                    source_name=target.get("source_name"),
+                    publish_time=target.get("publish_time"),
+                    department=target.get("department"),
+                )}
             # 无检索结果时（自然语言问答可能先取详情），回退到详情对象
             if state.policy_details:
                 policy = state.policy_details[0]
-                return {
-                    "policy_text": policy.get("content", ""),
-                    "title": policy.get("title", "")
-                }
-            return {"policy_text": "", "title": ""}
+                if policy.get("content") and len(policy.get("content", "")) >= 50:
+                    state.current_analyze_target = policy
+                    return {
+                        "policy_text": policy.get("content", ""),
+                        "title": policy.get("title", "")
+                    }
+                return {_BUSINESS_RESULT_KEY: content_error_payload(
+                    status=CONTENT_MISSING,
+                    error_code=CONTENT_NOT_READY,
+                    error="政策已定位，但正文尚未就绪，请稍后重试",
+                    retryable=True,
+                    policy_id=PolicyService.trusted_policy_id(policy),
+                    title=policy.get("title"),
+                    url=policy.get("url"),
+                    source_name=policy.get("source_name"),
+                    publish_time=policy.get("publish_time"),
+                    department=policy.get("department"),
+                )}
+            return {_BUSINESS_RESULT_KEY: content_error_payload(
+                status=CONTENT_MISSING,
+                error_code=CONTENT_NOT_READY,
+                error="未取得可分析的政策正文，请稍后重试",
+                retryable=True,
+            )}
         elif tool_name == "analyze_policies_batch":
             from app.config import get_report_top_n
 
@@ -639,7 +753,13 @@ class PolicyAgent:
                 state.policies = result
                 logger.info(f"搜索到 {len(result)} 条政策")
         elif tool_name == "get_policy_detail":
-            if result:
+            if isinstance(result, dict) and result.get("error_code"):
+                self._record_analysis_failure(state, result)
+                logger.warning(
+                    "政策详情业务错误: %s (%s)",
+                    result.get("error"), result.get("error_code"),
+                )
+            elif result:
                 state.policy_details.append(result)
         elif tool_name == "search_historical_policies":
             if isinstance(result, list):
@@ -648,34 +768,34 @@ class PolicyAgent:
                 logger.info(f"历史搜索到 {len(result)} 条政策")
         elif tool_name == "analyze_policy":
             if not isinstance(result, dict):
-                state.analysis_failures.append({
-                    "error": "分析工具返回了非字典结果",
-                    "result_type": type(result).__name__,
-                })
+                self._record_analysis_failure(
+                    state,
+                    {
+                        "error": "分析工具返回了非字典结果",
+                        "result_type": type(result).__name__,
+                    },
+                    fallback_policy=state.current_analyze_target,
+                )
                 logger.warning("分析结果类型无效: %s", type(result).__name__)
                 return
 
             # 先绑定实际分析对象，失败结果也保留可追溯的政策标识。
             self._bind_analysis_to_source_policy(state, result)
             if result.get("error"):
-                state.analysis_failures.append({
-                    "error": str(result["error"]),
-                    "policy_id": result.get("policy_id"),
-                    "url": result.get("url"),
-                    "title": result.get("title"),
-                })
+                self._record_analysis_failure(state, result)
                 logger.warning("分析失败，未进入报告: %s", result["error"])
                 return
 
             # 兜底结果标记为 failed 时属于不可用分析。
             if result.get("_analysis_status") == ANALYSIS_STATUS_FAILED:
-                state.analysis_failures.append({
-                    "error": result.get("_analysis_error") or "分析失败",
-                    "policy_id": result.get("policy_id"),
-                    "url": result.get("url"),
-                    "title": result.get("title"),
-                    "_analysis_source": result.get("_analysis_source"),
-                })
+                self._record_analysis_failure(
+                    state,
+                    {
+                        **result,
+                        "error": result.get("_analysis_error") or "分析失败",
+                    },
+                    fallback_policy=state.current_analyze_target,
+                )
                 logger.warning(
                     "分析状态为失败，未进入报告: %s",
                     str(result.get("title", ""))[:30],
@@ -702,7 +822,7 @@ class PolicyAgent:
             logger.info(f"分析完成: 趋势评分 {result.get('趋势评分', 0)}")
         elif tool_name == "analyze_policies_batch":
             if not isinstance(result, dict):
-                state.analysis_failures.append({
+                self._record_analysis_failure(state, {
                     "error": "批量分析工具返回了非字典结果",
                     "result_type": type(result).__name__,
                 })
@@ -713,7 +833,7 @@ class PolicyAgent:
 
             container_error = result.get("error")
             if container_error:
-                state.analysis_failures.append({
+                self._record_analysis_failure(state, {
                     "error": str(container_error),
                     "requested": result.get("requested"),
                 })
@@ -724,20 +844,14 @@ class PolicyAgent:
             for failure in result.get("failures") or []:
                 if not isinstance(failure, dict):
                     failure = {"error": str(failure)}
-                state.analysis_failures.append({
-                    "policy_id": failure.get("policy_id"),
-                    "url": failure.get("url"),
-                    "title": failure.get("title"),
-                    "error": failure.get("error") or "批量分析失败",
-                    "_analysis_source": failure.get("_analysis_source"),
-                })
+                self._record_analysis_failure(state, failure)
                 failed_count += 1
 
             trusted_count = 0
             degraded_count = 0
             for analysis in result.get("results") or []:
                 if not isinstance(analysis, dict):
-                    state.analysis_failures.append({
+                    self._record_analysis_failure(state, {
                         "error": "批量分析返回了非字典条目",
                         "result_type": type(analysis).__name__,
                     })
@@ -747,12 +861,9 @@ class PolicyAgent:
                 url = analysis.get("url")
                 title = analysis.get("title")
                 if analysis.get("_analysis_status") == ANALYSIS_STATUS_FAILED:
-                    state.analysis_failures.append({
-                        "policy_id": policy_id,
-                        "url": url,
-                        "title": title,
+                    self._record_analysis_failure(state, {
+                        **analysis,
                         "error": analysis.get("_analysis_error") or "分析失败",
-                        "_analysis_source": analysis.get("_analysis_source"),
                     })
                     failed_count += 1
                     continue
@@ -786,6 +897,55 @@ class PolicyAgent:
                     state.report_error = None
                     state.pushed_policies = result.get("pushed_policies") or []
                     logger.info(f"报告已生成: {state.report_path}")
+
+    def _record_analysis_failure(
+        self,
+        state: AgentState,
+        failure: Any,
+        *,
+        fallback_policy: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """记录可追溯、已去重的分析失败。
+
+        只有调用方明确知道失败属于哪条政策时才传 fallback_policy。批量容器
+        错误和无名条目不得自动绑定检索结果首项；回退主键也必须经过可信 ID
+        校验，防止把爬虫原始 ID 写入 ``policy_id``。
+        """
+        if isinstance(failure, dict):
+            item = dict(failure)
+        elif failure is None:
+            item = {"error": "本次分析未完成"}
+        else:
+            item = {"error": str(failure)}
+
+        if isinstance(fallback_policy, dict):
+            fallback_id = PolicyService.trusted_policy_id(fallback_policy)
+            if not item.get("policy_id") and fallback_id:
+                item["policy_id"] = fallback_id
+            for key in (
+                "title",
+                "url",
+                "source_name",
+                "publish_time",
+                "department",
+                "government_level",
+                "city",
+            ):
+                if not item.get(key) and fallback_policy.get(key):
+                    item[key] = fallback_policy[key]
+
+        if not item.get("error"):
+            item["error"] = "本次分析未完成"
+
+        for existing in state.analysis_failures:
+            if not isinstance(existing, dict):
+                continue
+            if not analysis_failures_match(existing, item):
+                continue
+            merge_analysis_failure(existing, item)
+            return
+
+        state.analysis_failures.append(item)
 
     @staticmethod
     def _next_analyze_target(state: AgentState) -> Optional[Dict[str, Any]]:
@@ -825,17 +985,9 @@ class PolicyAgent:
         """
         source: Optional[Dict[str, Any]] = state.current_analyze_target
         if not isinstance(source, dict):
-            source = None
-        # 回退链保持 A 阶段行为：游标没有记录（例如分析结果不是经
-        # _build_tool_arguments 产生的）时，仍按第一条检索结果绑，
-        # 再退到详情对象。只认 current_analyze_target 会让这类调用绑不上。
-        if not source and state.search_results:
-            source = state.search_results[0]
-        if not source and state.policy_details:
-            source = state.policy_details[0]
-        if not isinstance(source, dict):
+            # 没有精确目标时宁可不绑定，也不能把分析挂到检索首项。
             return
-        policy_id = source.get("policy_id") or source.get("id")
+        policy_id = PolicyService.trusted_policy_id(source)
         if policy_id:
             analysis["policy_id"] = policy_id
         if source.get("url"):
